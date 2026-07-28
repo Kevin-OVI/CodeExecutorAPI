@@ -83,7 +83,7 @@ def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event,
             r, _, _ = select.select([master_fd], [], [], 0.1)
             if not r:
                 continue
-            chunk = os.read(r[0], 4096)
+            chunk = os.read(r[0], min(4096, max_size - read_size))
             read_size += len(chunk)
             output.write(chunk)
         stop_evt.wait()
