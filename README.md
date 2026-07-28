@@ -36,7 +36,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `EXECUTION_TIMEOUT` (default: `20` seconds)
 - `MAX_MEMORY` (default: `256M`)
 - `MAX_CPU_CORES` (default: `1`)
-- `MAX_OUTPUT_SIZE` (default: `3000` bytes)
+- `MAX_OUTPUT_SIZE` (default: `10485760` bytes)
 - `CONTAINER_PIDS_LIMIT` (default: `128`)
 - `CONTAINER_ULIMIT_NOFILE` (default: `1024`)
 - `CONTAINER_ULIMIT_NPROC` (default: `128`)
