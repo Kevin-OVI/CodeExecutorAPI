@@ -1,11 +1,11 @@
 # Code Executor API (aiohttp + Docker)
 
-Code Executor API runs untrusted code inside hardened, ephemeral Docker containers (no capabilities, read-only root, no network, resource limits) and exposes the result over HTTP. Callers manage a persistent **session** (a server-side working directory) so files can be created, read, and deleted across multiple executions without re-uploading a whole directory snapshot each time.
+Code Executor API runs untrusted code inside hardened, ephemeral Docker containers (no capabilities, read-only root, resource limits) and exposes the result over HTTP. Callers manage a persistent **session** (a server-side working directory) so files can be created, read, and deleted across multiple executions without re-uploading a whole directory snapshot each time.
 
 ## Features
 
 - `aiohttp` API with session management (`/sessions`), per-file access (`/sessions/{id}/files/{path}`), code execution (`/execute`), and `/health`
-- Sandboxed execution via `docker run --network=none` with CPU/memory/pid/ulimit caps and a hard wall-clock timeout
+- Sandboxed execution via `docker run` with CPU/memory/pid/ulimit caps and a hard wall-clock timeout
 - Supports python, bash, javascript, c, java
 - Sessions persist a working directory across executions, guarded by a per-session lock; idle sessions expire automatically
 - `execute` reports exactly what changed: created/modified files (returned as multipart attachments) and deleted files
@@ -13,7 +13,6 @@ Code Executor API runs untrusted code inside hardened, ephemeral Docker containe
 ## Requirements
 
 - Python 3.12+
-- Linux (the executor uses `pty` and descriptor-relative filesystem operations)
 - Docker
 - A Docker image must be created before starting the API using `Dockerfile`
   ```cmd
@@ -24,7 +23,7 @@ Code Executor API runs untrusted code inside hardened, ephemeral Docker containe
 
 ```cmd
 python -m venv .venv
-. .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -32,9 +31,8 @@ pip install -r requirements.txt
 
 The service reads these environment variables at import/startup (see `code_executor_api/config.py`):
 
-- `HOST` (default: `127.0.0.1`)
+- `HOST` (default: `0.0.0.0`)
 - `PORT` (default: `40003`)
-- `API_TOKEN` (optional on loopback; required for a non-loopback bind, minimum 32 characters)
 - `EXECUTION_TIMEOUT` (default: `20` seconds)
 - `MAX_MEMORY` (default: `256M`)
 - `MAX_CPU_CORES` (default: `1`)
@@ -71,14 +69,6 @@ Override host/port from CLI:
 ```cmd
 python app.py --host 127.0.0.1 --port 40003
 ```
-
-Binding to a non-loopback interface requires a high-entropy bearer token. Terminate TLS and enforce per-client rate limits in a reverse proxy before exposing the API outside a trusted host:
-
-```cmd
-API_TOKEN="..." python app.py --host 0.0.0.0 --port 40003
-```
-
-Send the token in the `Authorization: Bearer ...` header. Session identifiers are deliberately omitted from access logs.
 
 ## API
 
@@ -127,12 +117,12 @@ curl -X DELETE http://127.0.0.1:40003/sessions/{session_id}/files/some/path.txt
 Response is `multipart/mixed`: the first part is `application/json` -
 
 ```json
-{"output": "...", "output_truncated": false, "return_code": 0, "execution_time": 0.42, "timed_out": false, "deleted_files": []}
+{"output": "...", "return_code": 0, "execution_time": 0.42, "timed_out": false, "deleted_files": []}
 ```
 
 - followed by one file part per file created or modified during the run (`Content-Disposition: attachment; filename="<sub_path>"`).
 
-Error statuses: `400` invalid input (bad language, null bytes in code, invalid path), `401` missing or invalid authentication, `404` missing session, `409` session lock timeout, `413` request/session/result limit, `415` wrong content type, `503` unavailable Docker environment or capacity, `500` unexpected error fallback.
+Error statuses: `400` invalid input (bad language, invalid path), `404` missing session, `409` session lock timeout, `413` request/session/result limit, `503` unavailable capacity, `500` unexpected error fallback.
 
 ## Local Harness
 

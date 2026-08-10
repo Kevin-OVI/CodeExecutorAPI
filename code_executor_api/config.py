@@ -5,10 +5,7 @@ def _read_str_env(name: str, default: str) -> str:
     raw_value = os.getenv(name)
     if raw_value is None:
         return default
-    value = raw_value.strip()
-    if not value:
-        raise ValueError(f"{name} must not be empty.")
-    return value
+    return raw_value.strip()
 
 
 def _read_optional_str_env(name: str) -> str | None:
@@ -21,7 +18,7 @@ def _read_optional_str_env(name: str) -> str | None:
     return value
 
 
-def _read_int_env(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+def _read_int_env(name: str, default: int, *, min_value: int | None = None) -> int:
     raw_value = os.getenv(name)
     if raw_value is None:
         return default
@@ -33,17 +30,12 @@ def _read_int_env(name: str, default: int, *, min_value: int | None = None, max_
 
     if min_value is not None and value < min_value:
         raise ValueError(f"{name} must be >= {min_value}.")
-    if max_value is not None and value > max_value:
-        raise ValueError(f"{name} must be <= {max_value}.")
 
     return value
 
 
-HOST = _read_str_env("HOST", "127.0.0.1")
-PORT = _read_int_env("PORT", 40003, min_value=1, max_value=65535)
-API_TOKEN = _read_optional_str_env("API_TOKEN")
-if API_TOKEN is not None and len(API_TOKEN) < 32:
-    raise ValueError("API_TOKEN must contain at least 32 characters.")
+HOST = _read_str_env("HOST", "0.0.0.0")
+PORT = _read_int_env("PORT", 40003, min_value=1)
 
 EXECUTION_TIMEOUT = _read_int_env("EXECUTION_TIMEOUT", 20, min_value=1)  # seconds
 MAX_MEMORY = _read_str_env("MAX_MEMORY", "256M")
@@ -57,7 +49,7 @@ MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_va
 CONTAINER_PIDS_LIMIT = _read_int_env("CONTAINER_PIDS_LIMIT", 128, min_value=1)
 CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_value=1)
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 10 * 1024 * 1024, min_value=1)  # bytes
-CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5, min_value=0, max_value=19)
+CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)
 CONTAINER_TMPFS_SIZE = _read_str_env("CONTAINER_TMPFS_SIZE", "64m")
 DOCKER_IMAGE = _read_str_env("DOCKER_IMAGE", "code_executor")
 DOCKER_CHECK_TIMEOUT_SECONDS = _read_int_env("DOCKER_CHECK_TIMEOUT_SECONDS", 5, min_value=1)

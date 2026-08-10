@@ -47,7 +47,6 @@ class ExecutionResourceLimitReached(Exception):
 
 class ExecutionResult(NamedTuple):
     output: str
-    output_truncated: bool
     return_code: int
     execution_time: float
     timed_out: bool
@@ -71,13 +70,15 @@ def _close_noerror(fd: int):
         pass
 
 
-def _hash_file(path: str) -> tuple[int, bytes]:
+def _hash_file(path: str, mode: int | None = None) -> tuple[int, bytes]:
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags)
     try:
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
             raise OSError(errno.EINVAL, "Not a regular file", path)
+        if mode is not None:
+            os.fchmod(fd, mode)
         sha256 = hashlib.sha256()
         with os.fdopen(fd, "rb") as f:
             fd = -1
@@ -89,10 +90,18 @@ def _hash_file(path: str) -> tuple[int, bytes]:
             os.close(fd)
 
 
-def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event, max_size: int = MAX_OUTPUT_SIZE) -> tuple[bytes, bool]:
+def _chmod_directory(path: str) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(path, flags)
+    try:
+        os.fchmod(fd, 0o777)
+    finally:
+        os.close(fd)
+
+
+def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event, max_size: int = MAX_OUTPUT_SIZE) -> bytes:
     try:
         output = io.BytesIO()
-        output_truncated = False
         while True:
             r, _, _ = select.select([master_fd], [], [], 0.1)
             if not r:
@@ -110,40 +119,10 @@ def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event,
             remaining_size = max_size - output.tell()
             if remaining_size > 0:
                 output.write(chunk[:remaining_size])
-            if len(chunk) > remaining_size:
-                output_truncated = True
-        return output.getvalue(), output_truncated
+        return output.getvalue()
     finally:
         _close_noerror(master_fd)
         _close_noerror(slave_fd)
-
-
-async def _run_docker_check(*arguments: str) -> bytes:
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "docker", *arguments,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise RuntimeError("Docker is not available") from exc
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        raise RuntimeError("Docker environment check timed out") from None
-    if process.returncode != 0:
-        message = stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(message or "Docker environment check failed")
-    return stdout
-
-
-async def check_docker_environment() -> None:
-    if os.getuid() == 0:
-        raise RuntimeError("CodeExecutorAPI must not run as root")
-    await _run_docker_check("info")
-    await _run_docker_check("image", "inspect", DOCKER_IMAGE)
 
 
 async def _remove_container(container_name: str) -> bool:
@@ -178,15 +157,21 @@ class ExecutionEnvironment:
 
         self.input_files_hashes: dict[str, tuple[int, bytes]] = {}
 
+        cache_directory = os.path.join(self.host_work_directory, ".cache")
         for directory, directories, files in os.walk(self.host_work_directory):
-            if directory == self.host_work_directory:
-                with contextlib.suppress(ValueError):
-                    directories.remove(".cache")
+            try:
+                _chmod_directory(directory)
+            except OSError:
+                directories.clear()
+                continue
+            in_cache = directory == cache_directory or directory.startswith(cache_directory + os.sep)
             for file in files:
                 full_path = os.path.join(directory, file)
                 try:
-                    file_size, file_hash = _hash_file(full_path)
+                    file_size, file_hash = _hash_file(full_path, 0o666)
                 except OSError:
+                    continue
+                if in_cache:
                     continue
                 sub_path = full_path[len(self.host_work_directory) + 1:]
                 self.input_files_hashes[sub_path] = (file_size, file_hash)
@@ -201,12 +186,11 @@ class ExecutionEnvironment:
         read_task = None
         process = None
         output = b""
-        output_truncated = False
         try:
             master_fd, slave_fd = pty.openpty()
             read_task = asyncio.create_task(asyncio.to_thread(read_max_and_close, master_fd, slave_fd, evt))
             command = COMMANDS[self.language]
-            current_niceness = min(19, os.nice(0) + CONTAINER_RELATIVE_NICENESS)
+            current_niceness = os.nice(0)
             process = await asyncio.create_subprocess_exec(
                 "docker", "run",
                 "--read-only",
@@ -217,18 +201,17 @@ class ExecutionEnvironment:
                 "--ulimit", f"fsize={CONTAINER_ULIMIT_FSIZE}:{CONTAINER_ULIMIT_FSIZE}",
                 "--cgroupns=private",
                 "--ipc=none",
-                "--network=none",
+                "--net=bridge",
                 "--tmpfs", f"/tmp:rw,nosuid,nodev,exec,size={CONTAINER_TMPFS_SIZE}",
                 "--interactive", "--tty", "--rm",
                 "--label", "code_executor_api.managed=true",
-                "--user", f"{os.getuid()}:{os.getgid()}",
                 f"--memory={MAX_MEMORY}",
                 f"--memory-swap={MAX_MEMORY}",
                 f"--cpus={MAX_CPU_CORES}",
                 "--volume", f"{self.host_work_directory}:/app/",
                 "--name", self.container_name,
                 DOCKER_IMAGE,
-                "nice", "-n", str(current_niceness),
+                "nice", "-n", str(current_niceness + CONTAINER_RELATIVE_NICENESS),
                 *command, self.code,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
             )
@@ -250,7 +233,7 @@ class ExecutionEnvironment:
                     await asyncio.wait_for(process.wait(), timeout=2)
             evt.set()
             if read_task is not None:
-                output, output_truncated = await read_task
+                output = await read_task
             else:
                 if master_fd is not None:
                     _close_noerror(master_fd)
@@ -259,7 +242,7 @@ class ExecutionEnvironment:
         execution_time = time.perf_counter() - start
 
         return ExecutionResult(
-            output=output.decode("utf-8", "surrogateescape"), output_truncated=output_truncated,
+            output=output.decode("utf-8", "surrogateescape").rstrip(),
             return_code=return_code, execution_time=execution_time, timed_out=timed_out,
         )
 

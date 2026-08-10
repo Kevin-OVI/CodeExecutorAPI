@@ -226,7 +226,7 @@ class SessionManager:
         for session_id in expired_ids:
             try:
                 await self.delete(session_id)
-                LOGGER.info("Swept expired session")
+                LOGGER.info("Swept expired session %s", session_id)
             except SessionNotFound:
                 pass
 

@@ -5,7 +5,7 @@ import os
 from aiofiles.tempfile import NamedTemporaryFile as AsyncNamedTemporaryFile
 from aiohttp import MultipartWriter, web
 
-from ..config import CONTAINER_ULIMIT_FSIZE, MAX_REQUEST_SIZE, MAX_SESSION_FILES
+from ..config import CONTAINER_ULIMIT_FSIZE, MAX_REQUEST_SIZE, MAX_SESSION_FILES, SESSION_ROOT_DIRECTORY
 from ..executor import ExecutionResourceLimitReached, run_code_async
 from ..file_helpers import ContentSizeLimiter, read_content, write_file_content
 from ..sessions import (
@@ -43,8 +43,6 @@ async def _read_text_part(part, max_size: int, size_limiter: ContentSizeLimiter)
 
 async def handle_execute(request: web.Request) -> web.Response:
     session_manager: SessionManager = request.app["session_manager"]
-    if request.content_type != "multipart/form-data":
-        return web.json_response({"error": "Content-Type must be multipart/form-data"}, status=415)
 
     session_id: str | None = None
     language: str | None = None
@@ -53,10 +51,7 @@ async def handle_execute(request: web.Request) -> web.Response:
     part_count = 0
 
     with cleanup_attachments() as attachments:
-        try:
-            reader = await request.multipart()
-        except (AssertionError, ValueError):
-            return web.json_response({"error": "Invalid multipart body"}, status=400)
+        reader = await request.multipart()
         async for part in reader:
             part_count += 1
             if part_count > MAX_SESSION_FILES:
@@ -72,7 +67,7 @@ async def handle_execute(request: web.Request) -> web.Response:
                 if part.filename is None:
                     return web.json_response({"error": "attachments parts must be files"}, status=400)
                 normalised_path = normalize_sub_path(part.filename)
-                async with AsyncNamedTemporaryFile("wb", delete=False) as f:
+                async with AsyncNamedTemporaryFile("wb", delete=False, dir=SESSION_ROOT_DIRECTORY) as f:
                     attachments.append((normalised_path, f.name))
                     await write_file_content(f, part, CONTAINER_ULIMIT_FSIZE, size_limiter)
             else:
@@ -98,7 +93,6 @@ async def handle_execute(request: web.Request) -> web.Response:
                         result_payload = mpwriter.append_json(
                             {
                                 "output": result.execution_result.output,
-                                "output_truncated": result.execution_result.output_truncated,
                                 "return_code": result.execution_result.return_code,
                                 "execution_time": result.execution_result.execution_time,
                                 "timed_out": result.execution_result.timed_out,
@@ -108,11 +102,6 @@ async def handle_execute(request: web.Request) -> web.Response:
                         result_payload.set_content_disposition("inline", name="result")
                         for attachment in result.attachments:
                             mpwriter.append_payload(session.read_file(attachment.sub_path, field_name="attachments"))
-                        response = web.StreamResponse(headers=mpwriter.headers)
-                        await response.prepare(request)
-                        await mpwriter.write(response)
-                        await response.write_eof()
-                        return response
         except SessionNotFound:
             return web.json_response({"error": "Session not found"}, status=404)
         except SessionLockTimeout:
@@ -131,3 +120,5 @@ async def handle_execute(request: web.Request) -> web.Response:
             if ephemeral and session_id is not None:
                 with contextlib.suppress(SessionNotFound):
                     await session_manager.delete(session_id)
+
+    return web.Response(body=mpwriter, headers=mpwriter.headers)

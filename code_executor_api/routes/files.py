@@ -22,14 +22,13 @@ async def handle_get_file(request: web.Request) -> web.Response:
                 content = session.read_file(sub_path)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
-            response = web.Response(body=content, content_type="application/octet-stream")
-            await response.prepare(request)
-            await response.write_eof()
-            return response
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
     except SessionLockTimeout:
         return web.json_response({"error": "Session is busy"}, status=409)
+
+    return web.Response(body=content, content_type="application/octet-stream")
+
 
 async def handle_put_file(request: web.Request) -> web.Response:
     session_manager: SessionManager = request.app["session_manager"]
