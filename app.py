@@ -1,9 +1,11 @@
 import argparse
+import ipaddress
 import logging
 
 from aiohttp import web
 
 from code_executor_api import HOST, PORT, create_app
+from code_executor_api.config import API_TOKEN
 
 LOGGER = logging.getLogger(__name__)
 
@@ -13,6 +15,15 @@ class HealthFilterAccessLogger(web.AccessLogger):
         if request.path == "/health":
             return
         super().log(request, response, time)
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _parse_port(value: str) -> int:
@@ -45,6 +56,8 @@ def main():
     args = _parse_args()
     host = args.host if args.host is not None else HOST
     port = args.port if args.port is not None else PORT
+    if API_TOKEN is None and not _is_loopback_host(host):
+        raise ValueError("API_TOKEN is required when binding to a non-loopback host.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     LOGGER.info(f"Starting CodeExecutorAPI server on {host}:{port}")
@@ -53,6 +66,7 @@ def main():
         host=host,
         port=port,
         access_log_class=HealthFilterAccessLogger,
+        access_log_format="%a %s %b %Tf",
     )
 
 

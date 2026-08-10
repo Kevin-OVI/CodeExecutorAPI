@@ -1,2 +1,2 @@
-aiohttp
-aiofiles
+aiohttp==3.13.2
+aiofiles==25.1.0
