@@ -1,4 +1,4 @@
-FROM python:3.14.6-trixie
+FROM python:3.14.7-trixie
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt,sharing=locked \
