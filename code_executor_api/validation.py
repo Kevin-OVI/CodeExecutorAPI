@@ -4,7 +4,7 @@ import posixpath
 from aiohttp import hdrs
 from aiohttp.web import HTTPBadRequest
 
-SUPPORTED_LANGUAGES = frozenset(("python", "bash", "javascript", "c", "java"))
+SUPPORTED_LANGUAGES = frozenset(("python", "bash", "javascript", "c", "cpp", "java"))
 
 
 class ValidationError(HTTPBadRequest):

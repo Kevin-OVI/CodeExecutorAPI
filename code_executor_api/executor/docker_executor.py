@@ -34,6 +34,7 @@ COMMANDS: dict[str, Iterable[str]] = {
     "bash": ("bash", "-c"),
     "javascript": ("node", "--input-type=module", "--eval"),
     "c": ("/executors/c.sh",),
+    "cpp": ("/executors/cpp.sh",),
     "java": ("/executors/java.sh",),
 }
 
