@@ -36,6 +36,8 @@ COMMANDS: dict[str, Iterable[str]] = {
     "c": ("/executors/c.sh",),
     "cpp": ("/executors/cpp.sh",),
     "java": ("/executors/java.sh",),
+    "csharp": ("/executors/csharp.sh",),
+    "rust": ("/executors/rust.sh",),
 }
 
 
