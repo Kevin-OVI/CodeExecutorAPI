@@ -1,7 +1,11 @@
 FROM python:3.14.7-trixie
 
+ENV RUSTUP_HOME=/usr/local/rustup \
+  CARGO_HOME=/usr/local/cargo
+
 RUN (curl -fsSL https://deb.nodesource.com/setup_24.x | bash) && \
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+  chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME" && \
   wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O packages-microsoft-prod.deb && \
   dpkg -i packages-microsoft-prod.deb && rm packages-microsoft-prod.deb && \
   apt update && apt upgrade -y && apt dist-upgrade -y && apt full-upgrade -y && \
@@ -17,7 +21,7 @@ RUN pip install -U pip && \
     scipy seaborn sympy tabulate watchdog websockets yt-dlp && \
   pip cache purge
 
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
   DOTNET_NOLOGO=1 \
   DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true \
