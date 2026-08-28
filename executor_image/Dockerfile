@@ -5,7 +5,7 @@ RUN (curl -fsSL https://deb.nodesource.com/setup_24.x | bash) && \
   wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod.deb -O packages-microsoft-prod.deb && \
   dpkg -i packages-microsoft-prod.deb && rm packages-microsoft-prod.deb && \
   apt update && apt upgrade -y && apt dist-upgrade -y && apt full-upgrade -y && \
-  apt install ca-certificates cmatrix cowsay curl dnsutils dotnet-sdk-8.0 fortune g++ gcc \
+  apt install ca-certificates cmatrix cowsay curl dnsutils dotnet-sdk-10.0 fortune g++ gcc \
     git gnupg iputils-ping lolcat lsb-release man net-tools nmap nodejs \
     openjdk-25-jdk-headless telnet tree wget -y && \
   apt clean
