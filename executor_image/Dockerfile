@@ -10,14 +10,18 @@ RUN (curl -fsSL https://deb.nodesource.com/setup_24.x | bash) && \
     openjdk-25-jdk-headless telnet tree wget -y && \
   apt clean
 
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 RUN pip install -U pip && \
   pip install -U aiohttp beautifulsoup4 bokeh boltons cryptography dateparser emoji \
     faker fpdf graphviz humanize imageio loguru markdown matplotlib more-itertools \
     networkx numpy pandas pillow plotly pydub python-dateutil python-whois requests \
     scipy seaborn sympy tabulate watchdog websockets yt-dlp && \
   pip cache purge
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+  DOTNET_NOLOGO=1 \
+  DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true \
+  DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=true
 
 COPY executors/* /executors/
 RUN chmod +x /executors/*.sh
