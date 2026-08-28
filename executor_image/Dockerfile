@@ -7,8 +7,8 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \
   (curl -fsSL https://deb.nodesource.com/setup_24.x | bash) && \
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
   chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME" && \
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     git gnupg iputils-ping lolcat lsb-release man net-tools nmap nodejs \
     openjdk-25-jdk-headless telnet tree wget -y
 
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,target=/root/.cache/pip,id=pip,sharing=locked \
   pip install -U pip && \
   pip install -U aiohttp beautifulsoup4 bokeh boltons cryptography dateparser emoji \
     faker fpdf graphviz humanize imageio loguru markdown matplotlib more-itertools \
