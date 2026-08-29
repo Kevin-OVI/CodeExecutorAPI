@@ -1,6 +1,8 @@
 from aiohttp import web
 
-from ..sessions import SessionLockTimeout, SessionManager, SessionNotFound
+from ..config import MAX_REQUEST_SIZE
+from ..file_helpers import ContentSizeLimiter
+from ..sessions import SessionLockTimeout, SessionManager, SessionNotFound, SessionResourceLimitReached
 
 __all__ = ("handle_get_file", "handle_put_file", "handle_delete_file")
 
@@ -18,7 +20,7 @@ async def handle_get_file(request: web.Request) -> web.Response:
         async with session_manager.locked(session_id) as session:
             try:
                 content = session.read_file(sub_path)
-            except (FileNotFoundError, IsADirectoryError):
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
@@ -35,11 +37,16 @@ async def handle_put_file(request: web.Request) -> web.Response:
 
     try:
         async with session_manager.locked(session_id) as session:
-            await session.write_file(sub_path, request.content)
+            try:
+                await session.write_file(sub_path, request.content, ContentSizeLimiter(MAX_REQUEST_SIZE))
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                return web.json_response({"error": "Invalid file path"}, status=400)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
     except SessionLockTimeout:
         return web.json_response({"error": "Session is busy"}, status=409)
+    except SessionResourceLimitReached as exc:
+        return web.json_response({"error": str(exc)}, status=413)
 
     return web.Response(status=204)
 
@@ -53,7 +60,7 @@ async def handle_delete_file(request: web.Request) -> web.Response:
         async with session_manager.locked(session_id) as session:
             try:
                 session.delete_file(sub_path)
-            except FileNotFoundError:
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
