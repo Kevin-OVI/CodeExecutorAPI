@@ -73,7 +73,14 @@ def _close_noerror(fd: int):
         pass
 
 
-def _hash_file(path: str, mode: int | None = None) -> tuple[int, bytes]:
+@contextlib.contextmanager
+def _open_regular_file(path: str, mode: int | None = None):
+    """Open a file for reading, refusing to follow symlinks, as a plain binary file object.
+
+    The builtin `open()`/`pathlib` cannot refuse to follow a symlink, so a raw
+    `O_NOFOLLOW` open is unavoidable here; it is confined to this one helper, which
+    yields a normal file object (plus its size) once the target is verified regular.
+    """
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags)
     try:
@@ -82,15 +89,23 @@ def _hash_file(path: str, mode: int | None = None) -> tuple[int, bytes]:
             raise OSError(errno.EINVAL, "Not a regular file", path)
         if mode is not None:
             os.fchmod(fd, mode)
-        sha256 = hashlib.sha256()
-        with os.fdopen(fd, "rb") as f:
-            fd = -1
-            for chunk in iter(lambda: f.read(4096), b""):
-                sha256.update(chunk)
-        return file_stat.st_size, sha256.digest()
-    finally:
-        if fd != -1:
-            os.close(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as f:
+        yield f, file_stat.st_size
+
+
+def _hash(f) -> bytes:
+    sha256 = hashlib.sha256()
+    for chunk in iter(lambda: f.read(4096), b""):
+        sha256.update(chunk)
+    return sha256.digest()
+
+
+def _hash_file(path: str, mode: int | None = None) -> tuple[int, bytes]:
+    with _open_regular_file(path, mode) as (f, size):
+        return size, _hash(f)
 
 
 def _chmod_directory(path: str) -> None:
@@ -160,21 +175,20 @@ class ExecutionEnvironment:
 
         self.input_files_hashes: dict[str, tuple[int, bytes]] = {}
 
-        cache_directory = os.path.join(self.host_work_directory, ".cache")
         for directory, directories, files in os.walk(self.host_work_directory):
+            if directory == self.host_work_directory:
+                with contextlib.suppress(ValueError):
+                    directories.remove(".cache")
             try:
                 _chmod_directory(directory)
             except OSError:
                 directories.clear()
                 continue
-            in_cache = directory == cache_directory or directory.startswith(cache_directory + os.sep)
             for file in files:
                 full_path = os.path.join(directory, file)
                 try:
                     file_size, file_hash = _hash_file(full_path, 0o666)
                 except OSError:
-                    continue
-                if in_cache:
                     continue
                 sub_path = full_path[len(self.host_work_directory) + 1:]
                 self.input_files_hashes[sub_path] = (file_size, file_hash)
@@ -223,13 +237,12 @@ class ExecutionEnvironment:
             except TimeoutError:
                 timed_out = True
         finally:
-            if process is not None and (process.returncode is None or process.returncode != 0):
-                removed = await _remove_container(self.container_name)
-                if not removed and process.returncode is None:
-                    LOGGER.error("Failed to remove container %s", self.container_name)
-                    with suppress(ProcessLookupError):
-                        process.kill()
             if process is not None and process.returncode is None:
+                # `docker run --rm` already cleans up on a normal exit; only a still-running
+                # (timed-out) container needs to be force-removed here.
+                removed = await _remove_container(self.container_name)
+                if not removed:
+                    LOGGER.error("Failed to remove container %s", self.container_name)
                 with suppress(ProcessLookupError):
                     process.kill()
                 with suppress(TimeoutError):
@@ -254,33 +267,35 @@ class ExecutionEnvironment:
         seen_sub_paths = set()
         session_entries = 0
         session_size = 0
-        cache_directory = os.path.join(self.host_work_directory, ".cache")
         for directory, directories, files in os.walk(self.host_work_directory):
+            if directory == self.host_work_directory:
+                with contextlib.suppress(ValueError):
+                    directories.remove(".cache")
             session_entries += len(directories) + len(files)
             if session_entries > MAX_SESSION_FILES:
                 raise ExecutionResourceLimitReached("Session contains too many files")
-            in_cache = directory == cache_directory or directory.startswith(cache_directory + os.sep)
 
             for file in files:
                 full_path = os.path.join(directory, file)
 
                 try:
-                    file_size, file_hash = _hash_file(full_path)
+                    with _open_regular_file(full_path) as (f, file_size):
+                        session_size += file_size
+                        sub_path = full_path[len(self.host_work_directory) + 1:]
+                        seen_sub_paths.add(sub_path)
+
+                        previous = self.input_files_hashes.get(sub_path)
+                        unchanged = (
+                                previous is not None and
+                                previous[0] == file_size and
+                                _hash(f) == previous[1]
+                        )
                 except OSError:
                     continue
-                session_size += file_size
+
                 if session_size > MAX_SESSION_SIZE:
                     raise ExecutionResourceLimitReached("Session storage limit reached")
-                if in_cache:
-                    continue
-
-                sub_path = full_path[len(self.host_work_directory) + 1:]
-                seen_sub_paths.add(sub_path)
-                if (
-                        sub_path in self.input_files_hashes and
-                        file_size == self.input_files_hashes[sub_path][0] and
-                        file_hash == self.input_files_hashes[sub_path][1]
-                ):
+                if unchanged:
                     continue  # Skip input attachments that match the original content
 
                 attachments.append(ResultAttachment(sub_path=sub_path, absolute_path=full_path))

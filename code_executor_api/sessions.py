@@ -61,6 +61,9 @@ class Session:
         size = 0
         entries = 0
         for directory, directories, files in os.walk(self.work_directory, followlinks=False):
+            if directory == self.work_directory:
+                with contextlib.suppress(ValueError):
+                    directories.remove(".cache")
             entries += len(directories) + len(files)
             if entries > MAX_SESSION_FILES:
                 raise SessionResourceLimitReached("Session contains too many files")
@@ -76,11 +79,14 @@ class Session:
         return size, entries
 
     @contextlib.contextmanager
-    def _open_parent(self, sub_path: str, create_dir: bool):
+    def _open_parent(self, sub_path: str, create_dir: bool, usage: tuple[int, int] | None = None):
         normalised_path = normalize_sub_path(sub_path)
         path_parts = normalised_path.split("/")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        size, entries = self._get_usage() if create_dir else (0, 0)
+        if create_dir:
+            size, entries = usage if usage is not None else self._get_usage()
+        else:
+            size, entries = 0, 0
         parent_fd = os.open(self.work_directory, flags)
         try:
             for path_part in path_parts[:-1]:
@@ -138,19 +144,21 @@ class Session:
                 os.close(fd)
                 raise
 
-    def import_file(self, sub_path: str, src_path: str):
+    async def import_file(self, sub_path: str, src_path: str):
         source_stat = os.stat(src_path, follow_symlinks=False)
         if not stat.S_ISREG(source_stat.st_mode):
             raise ValueError("Only regular files can be imported")
         if source_stat.st_size > CONTAINER_ULIMIT_FSIZE:
             raise SessionResourceLimitReached("File size limit reached")
-        with self._open_parent(sub_path, True) as (parent_fd, filename, _, size, entries):
+        usage = await asyncio.to_thread(self._get_usage)
+        with self._open_parent(sub_path, True, usage=usage) as (parent_fd, filename, _, size, entries):
             existing, existing_size = self._get_existing_file(parent_fd, filename)
             self._validate_replacement(size, entries, existing, existing_size, source_stat.st_size)
             os.replace(src_path, filename, dst_dir_fd=parent_fd)
 
     async def write_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter | None = None):
-        with self._open_parent(sub_path, True) as (parent_fd, filename, _, size, entries):
+        usage = await asyncio.to_thread(self._get_usage)
+        with self._open_parent(sub_path, True, usage=usage) as (parent_fd, filename, _, size, entries):
             existing, existing_size = self._get_existing_file(parent_fd, filename)
 
             def validate_size(new_size: int) -> None:
@@ -188,10 +196,20 @@ class SessionManager:
 
     async def delete(self, session_id: str) -> None:
         session = self.get(session_id)
-        with contextlib.suppress(FileNotFoundError):
-            await asyncio.to_thread(shutil.rmtree, session.work_directory)
-        if self._sessions.get(session_id) is session:
+        try:
+            await asyncio.wait_for(session.lock.acquire(), timeout=SESSION_LOCK_WAIT_TIMEOUT_SECONDS)
+        except TimeoutError:
+            raise SessionLockTimeout(session_id) from None
+        try:
+            # Re-check membership: another caller may have already deleted this session
+            # while we were waiting for the lock.
+            if self._sessions.get(session_id) is not session:
+                raise SessionNotFound(session_id)
+            with contextlib.suppress(FileNotFoundError):
+                await asyncio.to_thread(shutil.rmtree, session.work_directory)
             self._sessions.pop(session_id)
+        finally:
+            session.lock.release()
 
     @contextlib.asynccontextmanager
     async def locked(self, session_id: str) -> AsyncGenerator[Session, Any]:
@@ -227,7 +245,7 @@ class SessionManager:
             try:
                 await self.delete(session_id)
                 LOGGER.info("Swept expired session %s", session_id)
-            except SessionNotFound:
+            except (SessionNotFound, SessionLockTimeout):
                 pass
 
     async def _sweep_loop(self) -> None:
@@ -251,5 +269,5 @@ class SessionManager:
 
     async def delete_all(self) -> None:
         for session_id in list(self._sessions.keys()):
-            with contextlib.suppress(SessionNotFound):
+            with contextlib.suppress(SessionNotFound, SessionLockTimeout):
                 await self.delete(session_id)

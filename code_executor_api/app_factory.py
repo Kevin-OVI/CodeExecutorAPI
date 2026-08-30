@@ -2,7 +2,6 @@ import logging
 
 from aiohttp import web
 
-from .config import MAX_REQUEST_SIZE
 from .routes import handle_create_session, handle_delete_file, handle_delete_session, handle_execute, handle_get_file, handle_health, handle_put_file
 from .sessions import SessionManager
 
@@ -23,7 +22,7 @@ async def on_cleanup(app: web.Application) -> None:
 
 
 def create_app() -> web.Application:
-    app = web.Application(client_max_size=MAX_REQUEST_SIZE)
+    app = web.Application()
     app["session_manager"] = SessionManager()
 
     app.router.add_post("/sessions", handle_create_session)

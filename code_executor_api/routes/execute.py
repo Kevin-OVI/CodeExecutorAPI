@@ -85,7 +85,7 @@ async def handle_execute(request: web.Request) -> web.Response:
             async with session_manager.locked(session_id) as session:
                 async with session_manager.execution_slot():
                     for sub_path, src_path in attachments:
-                        session.import_file(sub_path, src_path)
+                        await session.import_file(sub_path, src_path)
 
                     result = await run_code_async(session.work_directory, language, code)
 

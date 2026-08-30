@@ -52,8 +52,7 @@ async def handle_delete_session(request: web.Request) -> web.Response:
     session_id = request.match_info["session_id"]
 
     try:
-        async with session_manager.locked(session_id):
-            await session_manager.delete(session_id)
+        await session_manager.delete(session_id)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
     except SessionLockTimeout:

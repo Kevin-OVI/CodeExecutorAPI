@@ -51,7 +51,14 @@ def _prepare_reader(content: SupportedContentType) -> tuple[_Reader, _EOFPredica
     return reader, at_eof
 
 
-async def _write_content(f, reader: _Reader, at_eof: _EOFPredicate, max_size: int, size_limiter: ContentSizeLimiter | None) -> int:
+async def _write_content(
+        f,
+        reader: _Reader,
+        at_eof: _EOFPredicate,
+        max_size: int,
+        size_limiter: ContentSizeLimiter | None,
+        on_chunk: Callable[[int], None] | None = None,
+) -> int:
     actual_size = 0
     while not at_eof():
         chunk = await reader(8192)
@@ -62,13 +69,21 @@ async def _write_content(f, reader: _Reader, at_eof: _EOFPredicate, max_size: in
             raise HTTPRequestEntityTooLarge(max_size=max_size, actual_size=actual_size)
         if size_limiter is not None:
             size_limiter.add(len(chunk))
+        if on_chunk is not None:
+            on_chunk(actual_size)
         await f.write(chunk)
     return actual_size
 
 
-async def write_file_content(f, content: SupportedContentType, max_size: int, size_limiter: ContentSizeLimiter | None = None) -> int:
+async def write_file_content(
+        f,
+        content: SupportedContentType,
+        max_size: int,
+        size_limiter: ContentSizeLimiter | None = None,
+        on_chunk: Callable[[int], None] | None = None,
+) -> int:
     reader, at_eof = _prepare_reader(content)
-    return await _write_content(f, reader, at_eof, max_size, size_limiter)
+    return await _write_content(f, reader, at_eof, max_size, size_limiter, on_chunk)
 
 
 async def read_content(content: SupportedContentType, max_size: int, size_limiter: ContentSizeLimiter | None = None) -> bytes:
@@ -102,8 +117,9 @@ async def write_file_at_content(
     try:
         async with aopen(fd, "wb", closefd=True) as f:
             fd = -1
-            actual_size = await write_file_content(f, content, max_size, size_limiter)
-        validate_size(actual_size)
+            # Validate the running size as it streams in, so an oversized upload is rejected
+            # without first writing the whole body to disk.
+            await write_file_content(f, content, max_size, size_limiter, on_chunk=validate_size)
         os.replace(temporary_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     except BaseException:
         if fd != -1:
