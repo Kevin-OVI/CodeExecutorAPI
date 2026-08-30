@@ -4,7 +4,7 @@ import logging
 from aiohttp import MultipartWriter, web
 
 from ..config import MAX_CODE_LENGTH, MAX_SESSION_SIZE
-from ..executor import ExecutionResourceLimitReached, run_code_async
+from ..executor import run_code_async
 from ..file_helpers import ContentSizeLimiter, read_content
 from ..sessions import (
     ExecutionLimitReached,
@@ -99,8 +99,6 @@ async def handle_execute(request: web.Request) -> web.Response:
     except ExecutionLimitReached:
         return web.json_response({"error": "Execution capacity reached"}, status=503)
     except SessionResourceLimitReached as exc:
-        return web.json_response({"error": str(exc)}, status=413)
-    except ExecutionResourceLimitReached as exc:
         return web.json_response({"error": str(exc)}, status=413)
     except (FileNotFoundError, IsADirectoryError):
         return web.json_response({"error": "Invalid attachment path"}, status=400)

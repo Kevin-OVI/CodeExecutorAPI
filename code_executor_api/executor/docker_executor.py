@@ -43,10 +43,6 @@ COMMANDS: dict[str, Iterable[str]] = {
 }
 
 
-class ExecutionResourceLimitReached(Exception):
-    pass
-
-
 class ExecutionResult(NamedTuple):
     output: str
     return_code: int
