@@ -4,27 +4,31 @@ import dataclasses
 import errno
 import logging
 import os
+import posixpath
 import secrets
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from typing import Any, AsyncGenerator
 
 from aiohttp import IOBasePayload
+from aiohttp.web import HTTPRequestEntityTooLarge
 
 from .config import (
+    CONTAINER_ULIMIT_FSIZE,
+    DOCKER_CHECK_TIMEOUT_SECONDS,
     MAX_CONCURRENT_EXECUTIONS,
     MAX_SESSIONS,
-    MAX_SESSION_FILES,
     MAX_SESSION_SIZE,
-    CONTAINER_ULIMIT_FSIZE,
     SESSION_INACTIVITY_TIMEOUT_SECONDS,
     SESSION_LOCK_WAIT_TIMEOUT_SECONDS,
+    SESSION_QUOTA_MOUNTPOINT,
     SESSION_ROOT_DIRECTORY,
     SESSION_SWEEP_INTERVAL_SECONDS,
 )
-from .file_helpers import ContentSizeLimiter, SupportedContentType, read_file, write_file_at_content
+from .file_helpers import ContentSizeLimiter, SupportedContentType, read_file, write_file_to_temp
 from .validation import normalize_sub_path
 
 LOGGER = logging.getLogger(__name__)
@@ -50,63 +54,90 @@ class ExecutionLimitReached(Exception):
     pass
 
 
+class QuotaSetupFailed(Exception):
+    pass
+
+
+# Basic-block-aligned range reserved for XFS project ids assigned to sessions; low ids are
+# conventionally left free for other uses of project quotas on the same filesystem.
+_PROJECT_ID_BASE = 1000
+_PROJECT_ID_MAX = 2 ** 31 - 1
+
+
+async def _apply_quota(work_directory: str, project_id: int) -> None:
+    if SESSION_QUOTA_MOUNTPOINT is None:
+        return
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "xfs_quota", "-x",
+            "-c", f"project -s -p {work_directory} {project_id}",
+            "-c", f"limit -p bhard={MAX_SESSION_SIZE}b {project_id}",
+            SESSION_QUOTA_MOUNTPOINT,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise QuotaSetupFailed(f"Failed to invoke xfs_quota: {exc}") from exc
+
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        raise QuotaSetupFailed(f"xfs_quota timed out for project {project_id}") from None
+
+    if process.returncode != 0:
+        raise QuotaSetupFailed(
+            f"xfs_quota setup failed for project {project_id}: {stderr.decode(errors='replace').strip()}"
+        )
+
+
+async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=sys.float_info.min)
+    except TimeoutError:
+        return False
+    return True
+
+
 @dataclasses.dataclass
 class Session:
     id: str
     work_directory: str
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     last_used: float = dataclasses.field(default_factory=time.monotonic)
+    files_size: dict[str, int] = dataclasses.field(default_factory=dict)
+    project_id: int | None = None
 
-    def _get_usage(self) -> tuple[int, int]:
-        size = 0
-        entries = 0
-        for directory, directories, files in os.walk(self.work_directory, followlinks=False):
-            if directory == self.work_directory:
-                with contextlib.suppress(ValueError):
-                    directories.remove(".cache")
-            entries += len(directories) + len(files)
-            if entries > MAX_SESSION_FILES:
-                raise SessionResourceLimitReached("Session contains too many files")
-            for filename in files:
-                try:
-                    file_stat = os.stat(os.path.join(directory, filename), follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISREG(file_stat.st_mode):
-                    size += file_stat.st_size
-                    if size > MAX_SESSION_SIZE:
-                        raise SessionResourceLimitReached("Session storage limit reached")
-        return size, entries
+    @property
+    def total_file_size(self) -> int:
+        return sum(self.files_size.values())
+
+    def get_maximum_allowed_size(self, sub_path: str) -> int:
+        return MAX_SESSION_SIZE - self.total_file_size + self.files_size.get(sub_path, 0)
 
     @contextlib.contextmanager
-    def _open_parent(self, sub_path: str, create_dir: bool, usage: tuple[int, int] | None = None):
-        normalised_path = normalize_sub_path(sub_path)
-        path_parts = normalised_path.split("/")
+    def _open_parent(self, normalised_sub_path: str, create_dir: bool):
+        path_parts = normalised_sub_path.split("/")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        if create_dir:
-            size, entries = usage if usage is not None else self._get_usage()
-        else:
-            size, entries = 0, 0
         parent_fd = os.open(self.work_directory, flags)
         try:
             for path_part in path_parts[:-1]:
                 if create_dir:
                     try:
-                        if entries + 1 > MAX_SESSION_FILES:
-                            raise SessionResourceLimitReached("Session contains too many files")
                         os.mkdir(path_part, 0o700, dir_fd=parent_fd)
-                        entries += 1
                     except FileExistsError:
                         pass
                 try:
                     next_fd = os.open(path_part, flags, dir_fd=parent_fd)
                 except OSError as exc:
                     if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                        raise FileNotFoundError(normalised_path) from None
+                        raise FileNotFoundError(normalised_sub_path) from None
                     raise
                 os.close(parent_fd)
                 parent_fd = next_fd
-            yield parent_fd, path_parts[-1], normalised_path, size, entries
+            yield parent_fd, path_parts[-1], normalised_sub_path
         finally:
             os.close(parent_fd)
 
@@ -120,57 +151,78 @@ class Session:
             raise IsADirectoryError(filename)
         return True, file_stat.st_size if stat.S_ISREG(file_stat.st_mode) else 0
 
-    @staticmethod
-    def _validate_replacement(size: int, entries: int, existing: bool, existing_size: int, new_size: int) -> None:
-        if entries + (0 if existing else 1) > MAX_SESSION_FILES:
-            raise SessionResourceLimitReached("Session contains too many files")
-        if size - existing_size + new_size > MAX_SESSION_SIZE:
-            raise SessionResourceLimitReached("Session storage limit reached")
-
     def read_file(self, sub_path: str, field_name: str | None = None) -> IOBasePayload:
-        with self._open_parent(sub_path, False) as (parent_fd, filename, normalised_path, _, _):
+        normalised_sub_path = normalize_sub_path(sub_path)
+        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, normalised_sub_path):
             flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
             try:
                 fd = os.open(filename, flags, dir_fd=parent_fd)
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
-                    raise FileNotFoundError(normalised_path) from None
+                    raise FileNotFoundError(normalised_sub_path) from None
                 raise
             try:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise FileNotFoundError(normalised_path)
-                return read_file(fd, filename=normalised_path, field_name=field_name)
+                    raise FileNotFoundError(normalised_sub_path)
+                return read_file(fd, filename=normalised_sub_path, field_name=field_name)
             except BaseException:
                 os.close(fd)
                 raise
 
-    async def import_file(self, sub_path: str, src_path: str):
-        source_stat = os.stat(src_path, follow_symlinks=False)
-        if not stat.S_ISREG(source_stat.st_mode):
-            raise ValueError("Only regular files can be imported")
-        if source_stat.st_size > CONTAINER_ULIMIT_FSIZE:
-            raise SessionResourceLimitReached("File size limit reached")
-        usage = await asyncio.to_thread(self._get_usage)
-        with self._open_parent(sub_path, True, usage=usage) as (parent_fd, filename, _, size, entries):
-            existing, existing_size = self._get_existing_file(parent_fd, filename)
-            self._validate_replacement(size, entries, existing, existing_size, source_stat.st_size)
-            os.replace(src_path, filename, dst_dir_fd=parent_fd)
+    async def stage_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter) -> tuple[str, str]:
+        """Write `content` to a hidden temp file inside sub_path's parent directory, without
+        making it visible under `sub_path` yet. Returns (normalised_sub_path, temporary_name)
+        to later pass to commit_staged_file (reveal it) or discard_staged_file (drop it)."""
+        normalised_sub_path = normalize_sub_path(sub_path)
+        size_limiter = size_limiter.reduced_max(self.get_maximum_allowed_size(normalised_sub_path))
+        try:
+            with self._open_parent(normalised_sub_path, True) as (parent_fd, _, _):
+                temporary_name, _ = await write_file_to_temp(parent_fd, content, CONTAINER_ULIMIT_FSIZE, size_limiter)
+        except HTTPRequestEntityTooLarge:
+            # Same outward error (413, JSON body) whether the tracked-bytes limiter or the
+            # OS-enforced XFS quota below is what actually rejected the write.
+            raise SessionResourceLimitReached("Session storage limit reached") from None
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise SessionResourceLimitReached("Session storage limit reached") from None
+            raise
+        return normalised_sub_path, temporary_name
 
-    async def write_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter | None = None):
-        usage = await asyncio.to_thread(self._get_usage)
-        with self._open_parent(sub_path, True, usage=usage) as (parent_fd, filename, _, size, entries):
-            existing, existing_size = self._get_existing_file(parent_fd, filename)
+    async def commit_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
+        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
+            size = os.stat(temporary_name, dir_fd=parent_fd).st_size
+            os.replace(temporary_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        self.files_size[normalised_sub_path] = size
 
-            def validate_size(new_size: int) -> None:
-                self._validate_replacement(size, entries, existing, existing_size, new_size)
+    async def discard_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
+        with self._open_parent(normalised_sub_path, False) as (parent_fd, _, _):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
 
-            await write_file_at_content(parent_fd, filename, content, CONTAINER_ULIMIT_FSIZE, validate_size, size_limiter)
+    async def write_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter):
+        normalised_sub_path, temporary_name = await self.stage_file(sub_path, content, size_limiter)
+        try:
+            await self.commit_staged_file(normalised_sub_path, temporary_name)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                await self.discard_staged_file(normalised_sub_path, temporary_name)
+            if exc.errno == errno.ENOSPC:
+                raise SessionResourceLimitReached("Session storage limit reached") from None
+            raise
 
     def delete_file(self, sub_path: str):
-        with self._open_parent(sub_path, False) as (parent_fd, filename, _, _, _):
+        normalised_sub_path = normalize_sub_path(sub_path)
+        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
             if stat.S_ISDIR(os.stat(filename, dir_fd=parent_fd, follow_symlinks=False).st_mode):
                 raise IsADirectoryError(filename)
             os.unlink(filename, dir_fd=parent_fd)
+            self.files_size.pop(normalised_sub_path, None)
+
+    def get_sub_path(self, full_path: str):
+        normalised_path = posixpath.normpath(full_path.replace("\\", "/"))
+        if not normalised_path.startswith(self.work_directory + "/"):
+            raise ValueError(f"Path {normalised_path!r} is not within the session directory ({self.work_directory!r})")
+        return normalised_path[len(self.work_directory) + 1:]
 
 
 class SessionManager:
@@ -178,6 +230,8 @@ class SessionManager:
         self._sessions: dict[str, Session] = {}
         self._sweep_task: asyncio.Task | None = None
         self._execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXECUTIONS)
+        self._next_project_id = _PROJECT_ID_BASE
+        self._free_project_ids: list[int] = []
 
     def get(self, session_id: str) -> Session:
         session = self._sessions.get(session_id)
@@ -185,31 +239,48 @@ class SessionManager:
             raise SessionNotFound(session_id)
         return session
 
-    def create(self) -> Session:
+    def _allocate_project_id(self) -> int:
+        if self._free_project_ids:
+            return self._free_project_ids.pop()
+        project_id = self._next_project_id
+        if project_id > _PROJECT_ID_MAX:
+            raise QuotaSetupFailed("Exhausted available XFS project ids")
+        self._next_project_id += 1
+        return project_id
+
+    def _release_project_id(self, project_id: int | None) -> None:
+        if project_id is not None:
+            self._free_project_ids.append(project_id)
+
+    async def create(self) -> Session:
         if len(self._sessions) >= MAX_SESSIONS:
             raise SessionLimitReached
         session_id = secrets.token_urlsafe(16)
         work_directory = tempfile.mkdtemp(prefix="code_executor_session_", dir=SESSION_ROOT_DIRECTORY)
-        session = Session(id=session_id, work_directory=work_directory)
+        project_id = self._allocate_project_id() if SESSION_QUOTA_MOUNTPOINT is not None else None
+
+        # Reserve the session slot (and the MAX_SESSIONS budget) synchronously, before the
+        # first `await` below, so a concurrent create() can't slip past the capacity check.
+        session = Session(id=session_id, work_directory=work_directory, project_id=project_id)
         self._sessions[session_id] = session
+        try:
+            if project_id is not None:
+                await _apply_quota(work_directory, project_id)
+        except BaseException:
+            self._sessions.pop(session_id, None)
+            self._release_project_id(project_id)
+            await asyncio.to_thread(shutil.rmtree, work_directory, ignore_errors=True)
+            raise
         return session
 
+    async def _delete(self, session: Session) -> None:
+        await asyncio.to_thread(shutil.rmtree, session.work_directory, ignore_errors=True)
+        self._release_project_id(session.project_id)
+        self._sessions.pop(session.id)
+
     async def delete(self, session_id: str) -> None:
-        session = self.get(session_id)
-        try:
-            await asyncio.wait_for(session.lock.acquire(), timeout=SESSION_LOCK_WAIT_TIMEOUT_SECONDS)
-        except TimeoutError:
-            raise SessionLockTimeout(session_id) from None
-        try:
-            # Re-check membership: another caller may have already deleted this session
-            # while we were waiting for the lock.
-            if self._sessions.get(session_id) is not session:
-                raise SessionNotFound(session_id)
-            with contextlib.suppress(FileNotFoundError):
-                await asyncio.to_thread(shutil.rmtree, session.work_directory)
-            self._sessions.pop(session_id)
-        finally:
-            session.lock.release()
+        async with self.locked(session_id) as session:
+            await self._delete(session)
 
     @contextlib.asynccontextmanager
     async def locked(self, session_id: str) -> AsyncGenerator[Session, Any]:
@@ -218,8 +289,10 @@ class SessionManager:
             await asyncio.wait_for(session.lock.acquire(), timeout=SESSION_LOCK_WAIT_TIMEOUT_SECONDS)
         except TimeoutError:
             raise SessionLockTimeout(session_id) from None
-        session.last_used = time.monotonic()
         try:
+            if self.get(session_id) is not session:
+                raise SessionNotFound(session_id)
+            session.last_used = time.monotonic()
             yield session
         finally:
             session.lock.release()
@@ -237,16 +310,22 @@ class SessionManager:
 
     async def _sweep_once(self) -> None:
         now = time.monotonic()
-        expired_ids = [
-            session_id for session_id, session in self._sessions.items()
-            if not session.lock.locked() and now - session.last_used > SESSION_INACTIVITY_TIMEOUT_SECONDS
-        ]
-        for session_id in expired_ids:
+        expired_sessions: list[Session] = []
+        for session in self._sessions.values():
+            if not await _try_acquire_lock(session.lock):
+                continue
+            if now - session.last_used <= SESSION_INACTIVITY_TIMEOUT_SECONDS:
+                session.lock.release()
+                continue
+            expired_sessions.append(session)
+
+        for session in expired_sessions:
             try:
-                await self.delete(session_id)
-                LOGGER.info("Swept expired session %s", session_id)
-            except (SessionNotFound, SessionLockTimeout):
-                pass
+                await self._delete(session)
+            except Exception as e:
+                LOGGER.exception("Failed to sweep expired session %s", session.id, exc_info=e)
+            else:
+                LOGGER.info("Swept expired session %s", session.id)
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -268,6 +347,5 @@ class SessionManager:
             self._sweep_task = None
 
     async def delete_all(self) -> None:
-        for session_id in list(self._sessions.keys()):
-            with contextlib.suppress(SessionNotFound, SessionLockTimeout):
-                await self.delete(session_id)
+        for session in list(self._sessions.values()):
+            await self._delete(session)

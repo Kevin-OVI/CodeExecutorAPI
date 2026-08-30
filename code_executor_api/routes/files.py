@@ -1,6 +1,6 @@
 from aiohttp import web
 
-from ..config import MAX_REQUEST_SIZE
+from ..config import MAX_SESSION_SIZE
 from ..file_helpers import ContentSizeLimiter
 from ..sessions import SessionLockTimeout, SessionManager, SessionNotFound, SessionResourceLimitReached
 
@@ -38,7 +38,7 @@ async def handle_put_file(request: web.Request) -> web.Response:
     try:
         async with session_manager.locked(session_id) as session:
             try:
-                await session.write_file(sub_path, request.content, ContentSizeLimiter(MAX_REQUEST_SIZE))
+                await session.write_file(sub_path, request.content, ContentSizeLimiter(MAX_SESSION_SIZE))
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return web.json_response({"error": "Invalid file path"}, status=400)
     except SessionNotFound:

@@ -26,9 +26,8 @@ from ..config import (
     MAX_CPU_CORES,
     MAX_MEMORY,
     MAX_OUTPUT_SIZE,
-    MAX_SESSION_FILES,
-    MAX_SESSION_SIZE,
 )
+from ..sessions import Session
 
 LOGGER = logging.getLogger(__name__)
 
@@ -162,21 +161,21 @@ async def _remove_container(container_name: str) -> bool:
 
 
 class ExecutionEnvironment:
-    __slots__ = ("language", "code", "container_name", "host_work_directory", "input_files_hashes")
+    __slots__ = ("session", "language", "code", "container_name", "input_files_hashes")
 
-    def __init__(self, langage: str, code, host_work_directory: str):
+    def __init__(self, session: Session, langage: str, code):
         if langage not in COMMANDS:
             raise ValueError(f"Unsupported language: {langage}")
+        self.session = session
         self.language = langage
         self.code = code
 
         self.container_name = f"ce_{secrets.token_urlsafe(16)}"
-        self.host_work_directory = host_work_directory
 
         self.input_files_hashes: dict[str, tuple[int, bytes]] = {}
 
-        for directory, directories, files in os.walk(self.host_work_directory):
-            if directory == self.host_work_directory:
+        for directory, directories, files in os.walk(session.work_directory):
+            if directory == session.work_directory:
                 with contextlib.suppress(ValueError):
                     directories.remove(".cache")
             try:
@@ -190,7 +189,7 @@ class ExecutionEnvironment:
                     file_size, file_hash = _hash_file(full_path, 0o666)
                 except OSError:
                     continue
-                sub_path = full_path[len(self.host_work_directory) + 1:]
+                sub_path = full_path[len(session.work_directory) + 1:]
                 self.input_files_hashes[sub_path] = (file_size, file_hash)
 
     async def run_container(self) -> ExecutionResult:
@@ -225,7 +224,7 @@ class ExecutionEnvironment:
                 f"--memory={MAX_MEMORY}",
                 f"--memory-swap={MAX_MEMORY}",
                 f"--cpus={MAX_CPU_CORES}",
-                "--volume", f"{self.host_work_directory}:/app/",
+                "--volume", f"{self.session.work_directory}:/app/",
                 "--name", self.container_name,
                 DOCKER_IMAGE,
                 "nice", "-n", str(current_niceness + CONTAINER_RELATIVE_NICENESS),
@@ -265,53 +264,43 @@ class ExecutionEnvironment:
     def get_attachments(self) -> tuple[list[ResultAttachment], list[str]]:
         attachments = []
         seen_sub_paths = set()
-        session_entries = 0
-        session_size = 0
-        for directory, directories, files in os.walk(self.host_work_directory):
-            if directory == self.host_work_directory:
+        files_size: dict[str, int] = {}
+        for directory, directories, files in os.walk(self.session.work_directory):
+            if directory == self.session.work_directory:
                 with contextlib.suppress(ValueError):
                     directories.remove(".cache")
-            session_entries += len(directories) + len(files)
-            if session_entries > MAX_SESSION_FILES:
-                raise ExecutionResourceLimitReached("Session contains too many files")
 
             for file in files:
                 full_path = os.path.join(directory, file)
 
                 try:
                     with _open_regular_file(full_path) as (f, file_size):
-                        session_size += file_size
-                        sub_path = full_path[len(self.host_work_directory) + 1:]
+                        sub_path = self.session.get_sub_path(full_path)
+                        files_size[sub_path] = file_size
                         seen_sub_paths.add(sub_path)
 
                         previous = self.input_files_hashes.get(sub_path)
                         unchanged = (
                                 previous is not None and
                                 previous[0] == file_size and
-                                _hash(f) == previous[1]
+                                previous[1] == _hash(f)
                         )
                 except OSError:
                     continue
 
-                if session_size > MAX_SESSION_SIZE:
-                    raise ExecutionResourceLimitReached("Session storage limit reached")
                 if unchanged:
                     continue  # Skip input attachments that match the original content
 
                 attachments.append(ResultAttachment(sub_path=sub_path, absolute_path=full_path))
 
+        self.session.files_size = files_size
+
         deleted_files = list(self.input_files_hashes.keys() - seen_sub_paths)
         return attachments, deleted_files
 
 
-async def run_code_async(work_directory: str, language: str, code: str) -> CodeExecutionResult:
-    environment: ExecutionEnvironment = await asyncio.to_thread(ExecutionEnvironment, language, code, work_directory)
+async def run_code_async(session: Session, language: str, code: str) -> CodeExecutionResult:
+    environment: ExecutionEnvironment = await asyncio.to_thread(ExecutionEnvironment, session, language, code)
     execution_result = await environment.run_container()
-    try:
-        result_attachments, deleted_files = await asyncio.wait_for(
-            asyncio.to_thread(environment.get_attachments),
-            timeout=EXECUTION_TIMEOUT,
-        )
-    except TimeoutError:
-        raise ExecutionResourceLimitReached("Execution result scan timed out") from None
+    result_attachments, deleted_files = await asyncio.to_thread(environment.get_attachments)
     return CodeExecutionResult(execution_result=execution_result, attachments=result_attachments, deleted_files=deleted_files)

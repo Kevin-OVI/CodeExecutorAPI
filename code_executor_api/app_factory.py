@@ -30,6 +30,7 @@ def create_app() -> web.Application:
     app.router.add_get("/sessions/{session_id}/files/{path:.*}", handle_get_file)
     app.router.add_put("/sessions/{session_id}/files/{path:.*}", handle_put_file)
     app.router.add_delete("/sessions/{session_id}/files/{path:.*}", handle_delete_file)
+    app.router.add_post("/sessions/{session_id}/execute", handle_execute)
     app.router.add_post("/execute", handle_execute)
     app.router.add_get("/health", handle_health)
 
