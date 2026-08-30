@@ -68,29 +68,35 @@ async def _apply_quota(work_directory: str, project_id: int) -> None:
     if SESSION_QUOTA_MOUNTPOINT is None:
         return
 
+    # xfs_quota's `b` suffix means 512-byte basic blocks, not bytes, so bhard must be given in
+    # KiB (`k`) instead — rounded up so the enforced limit is never looser than MAX_SESSION_SIZE.
+    bhard_kib = -(-MAX_SESSION_SIZE // 1024)
+
     try:
         process = await asyncio.create_subprocess_exec(
             "xfs_quota", "-x",
             "-c", f"project -s -p {work_directory} {project_id}",
-            "-c", f"limit -p bhard={MAX_SESSION_SIZE}b {project_id}",
+            "-c", f"limit -p bhard={bhard_kib}k {project_id}",
             SESSION_QUOTA_MOUNTPOINT,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
         raise QuotaSetupFailed(f"Failed to invoke xfs_quota: {exc}") from exc
 
     try:
-        _, stderr = await asyncio.wait_for(process.communicate(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
     except TimeoutError:
         process.kill()
         await process.wait()
         raise QuotaSetupFailed(f"xfs_quota timed out for project {project_id}") from None
 
-    if process.returncode != 0:
-        raise QuotaSetupFailed(
-            f"xfs_quota setup failed for project {project_id}: {stderr.decode(errors='replace').strip()}"
-        )
+    # xfs_quota routinely reports a failed -c clause (bad mountpoint, permission denied,
+    # project quota not enabled, ...) on stdout while still exiting 0, so a clean returncode
+    # alone does not prove the limit was actually applied.
+    output = f"{stdout.decode(errors='replace')}{stderr.decode(errors='replace')}".strip()
+    if process.returncode != 0 or output:
+        raise QuotaSetupFailed(f"xfs_quota setup failed for project {project_id}: {output}")
 
 
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
