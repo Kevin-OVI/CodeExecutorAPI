@@ -64,20 +64,10 @@ _PROJECT_ID_BASE = 1000
 _PROJECT_ID_MAX = 2 ** 31 - 1
 
 
-async def _apply_quota(work_directory: str, project_id: int) -> None:
-    if SESSION_QUOTA_MOUNTPOINT is None:
-        return
-
-    # xfs_quota's `b` suffix means 512-byte basic blocks, not bytes, so bhard must be given in
-    # KiB (`k`) instead — rounded up so the enforced limit is never looser than MAX_SESSION_SIZE.
-    bhard_kib = -(-MAX_SESSION_SIZE // 1024)
-
+async def _run_xfs_quota(*args: str) -> tuple[int, str, str]:
     try:
         process = await asyncio.create_subprocess_exec(
-            "xfs_quota", "-x",
-            "-c", f"project -s -p {work_directory} {project_id}",
-            "-c", f"limit -p bhard={bhard_kib}k {project_id}",
-            SESSION_QUOTA_MOUNTPOINT,
+            "xfs_quota", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -89,14 +79,50 @@ async def _apply_quota(work_directory: str, project_id: int) -> None:
     except TimeoutError:
         process.kill()
         await process.wait()
-        raise QuotaSetupFailed(f"xfs_quota timed out for project {project_id}") from None
+        raise QuotaSetupFailed(f"xfs_quota timed out: {' '.join(args)}") from None
 
-    # xfs_quota routinely reports a failed -c clause (bad mountpoint, permission denied,
-    # project quota not enabled, ...) on stdout while still exiting 0, so a clean returncode
-    # alone does not prove the limit was actually applied.
-    output = f"{stdout.decode(errors='replace')}{stderr.decode(errors='replace')}".strip()
-    if process.returncode != 0 or output:
-        raise QuotaSetupFailed(f"xfs_quota setup failed for project {project_id}: {output}")
+    return process.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def _apply_quota(work_directory: str, project_id: int) -> None:
+    if SESSION_QUOTA_MOUNTPOINT is None:
+        return
+
+    # xfs_quota's `b` suffix means 512-byte basic blocks, not bytes, so bhard must be given in
+    # KiB (`k`) instead — rounded up so the enforced limit is never looser than MAX_SESSION_SIZE.
+    bhard_kib = -(-MAX_SESSION_SIZE // 1024)
+
+    returncode, stdout, stderr = await _run_xfs_quota(
+        "-x",
+        "-c", f"project -s -p {work_directory} {project_id}",
+        "-c", f"limit -p bhard={bhard_kib}k {project_id}",
+        SESSION_QUOTA_MOUNTPOINT,
+    )
+    if returncode != 0:
+        raise QuotaSetupFailed(
+            f"xfs_quota setup failed for project {project_id}: {(stdout + stderr).strip()}"
+        )
+
+    # `limit`/`project -s` can fail to actually register a hard limit while still exiting 0 and
+    # printing only the routine "Setting up project ... Processed N paths ..." success banner
+    # (e.g. when project quota accounting isn't enabled on the target filesystem), so confirm
+    # the limit really landed rather than trusting the returncode alone.
+    returncode, stdout, stderr = await _run_xfs_quota("-x", "-c", "report -p -N -b", SESSION_QUOTA_MOUNTPOINT)
+    if returncode != 0:
+        raise QuotaSetupFailed(
+            f"xfs_quota verification failed for project {project_id}: {(stdout + stderr).strip()}"
+        )
+
+    for line in stdout.splitlines():
+        fields = line.split()
+        if fields and fields[0] == f"#{project_id}":
+            if len(fields) < 4 or not fields[3].isdigit() or int(fields[3]) <= 0:
+                raise QuotaSetupFailed(
+                    f"xfs_quota reports no hard limit set for project {project_id}: {line.strip()}"
+                )
+            return
+
+    raise QuotaSetupFailed(f"xfs_quota project {project_id} not found in report after setup")
 
 
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
