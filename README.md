@@ -6,7 +6,7 @@ Code Executor API runs untrusted code inside hardened, ephemeral Podman containe
 
 - `aiohttp` API with session management (`/sessions`), per-file access (`/sessions/{id}/files/{path}`), code execution (`/execute` and `/sessions/{id}/execute`), and `/health`
 - Sandboxed execution via `podman run` with CPU/memory/pid/ulimit caps and a hard wall-clock timeout
-- Supports python, bash, javascript, c, c++, java, c#, rust
+- Supports python, bash, javascript, typescript, c, c++, java, c#, rust
 - Sessions persist a working directory across executions, guarded by a per-session lock; idle sessions expire automatically
 - `execute` reports exactly what changed: created/modified files (returned as multipart attachments) and deleted files
 
@@ -154,7 +154,10 @@ curl -X DELETE http://127.0.0.1:40003/sessions/{session_id}/files/some/path.txt
 `POST /execute` or `POST /sessions/{session_id}/execute` as `multipart/form-data`:
 
 - `session_id` (path segment, only for `/sessions/{session_id}/execute`) - must reference a live session (`404` otherwise); if you instead call `POST /execute`, a throwaway session is created and destroyed for this call only
-- `language` (text field) - one of `python`, `bash`, `javascript`, `c`, `cpp`, `java`, `csharp`, `rust`
+- `language` (text field) - one of `python`, `bash`, `javascript`, `typescript`, `c`, `cpp`, `java`, `csharp`, `rust`
+  - `javascript` accepts both CommonJS and ES module syntax (Node resolves the module type from the code itself) and supports top-level `await`
+  - `typescript` is transpiled by `tsx`, which strips types without checking them, so a type error surfaces as a runtime failure rather than blocking the run; it executes as CommonJS, accepting `require`, `import`, `enum` and `namespace`, but not top-level `await`
+  - both resolve relative paths and module specifiers against the session directory, so code can read and import files already in the session
 - `code` (text field)
 - `attachments` (optional file parts, filename = sub_path) - created/overwritten in the session before execution
 
