@@ -18,10 +18,10 @@ from aiohttp.web import HTTPRequestEntityTooLarge
 
 from .config import (
     CONTAINER_ULIMIT_FSIZE,
-    DOCKER_CHECK_TIMEOUT_SECONDS,
     MAX_CONCURRENT_EXECUTIONS,
     MAX_SESSIONS,
     MAX_SESSION_SIZE,
+    PODMAN_CHECK_TIMEOUT_SECONDS,
     SESSION_INACTIVITY_TIMEOUT_SECONDS,
     SESSION_LOCK_WAIT_TIMEOUT_SECONDS,
     SESSION_QUOTA_MOUNTPOINT,
@@ -75,7 +75,7 @@ async def _run_xfs_quota(*args: str) -> tuple[int, str, str]:
         raise QuotaSetupFailed(f"Failed to invoke xfs_quota: {exc}") from exc
 
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=PODMAN_CHECK_TIMEOUT_SECONDS)
     except TimeoutError:
         process.kill()
         await process.wait()

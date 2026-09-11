@@ -41,7 +41,7 @@ EXECUTION_TIMEOUT = _read_int_env("EXECUTION_TIMEOUT", 20, min_value=1)  # secon
 MAX_MEMORY = _read_str_env("MAX_MEMORY", "256M")
 MAX_CPU_CORES = _read_int_env("MAX_CPU_CORES", 1, min_value=1)
 MAX_OUTPUT_SIZE = _read_int_env("MAX_OUTPUT_SIZE", 10 * 1024 * 1024, min_value=1)  # bytes
-MAX_CODE_LENGTH = _read_int_env("MAX_CODE_LENGTH", 64 * 1024, min_value=1)  # bytes, must stay below the kernel's MAX_ARG_STRLEN (128 KiB) since code is passed as a single `docker run` argv entry
+MAX_CODE_LENGTH = _read_int_env("MAX_CODE_LENGTH", 64 * 1024, min_value=1)  # bytes, must stay below the kernel's MAX_ARG_STRLEN (128 KiB) since code is passed as a single `podman run` argv entry
 MAX_SESSION_SIZE = _read_int_env("MAX_SESSION_SIZE", 100 * 1024 * 1024, min_value=1)  # bytes
 MAX_SESSIONS = _read_int_env("MAX_SESSIONS", 64, min_value=1)
 MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_value=1)
@@ -50,8 +50,8 @@ CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_val
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 256 * 1024 * 1024, min_value=1)  # bytes
 CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)
 CONTAINER_TMPFS_SIZE = _read_str_env("CONTAINER_TMPFS_SIZE", "64m")
-DOCKER_IMAGE = _read_str_env("DOCKER_IMAGE", "code_executor")
-DOCKER_CHECK_TIMEOUT_SECONDS = _read_int_env("DOCKER_CHECK_TIMEOUT_SECONDS", 5, min_value=1)
+PODMAN_IMAGE = _read_str_env("PODMAN_IMAGE", "code_executor")
+PODMAN_CHECK_TIMEOUT_SECONDS = _read_int_env("PODMAN_CHECK_TIMEOUT_SECONDS", 5, min_value=1)
 
 SESSION_INACTIVITY_TIMEOUT_SECONDS = _read_int_env("SESSION_INACTIVITY_TIMEOUT_SECONDS", 1800, min_value=1)
 SESSION_SWEEP_INTERVAL_SECONDS = _read_int_env("SESSION_SWEEP_INTERVAL_SECONDS", 60, min_value=1)

@@ -1,6 +1,7 @@
-# syntax=docker/dockerfile:1
-FROM python:3.14.7-trixie
+FROM docker.io/library/python:3.14.7-trixie
 
+# `docker-clean` is the literal name of the apt config shipped by the base image; dropping it
+# (and keeping downloaded packages) is what makes the apt cache mounts below effective.
 RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
@@ -35,8 +36,8 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=pip,sharing=locked \
   pip install -U pip && \
   pip install -U aiohttp beautifulsoup4 bokeh boltons cryptography dateparser emoji \
     faker fpdf graphviz humanize imageio loguru markdown matplotlib more-itertools \
-    networkx numpy pandas pillow plotly pydub python-dateutil python-whois requests \
-    scipy seaborn sympy tabulate watchdog websockets yt-dlp
+    networkx numpy pandas paho-mqtt pillow plotly pydub python-dateutil python-whois \
+    requests scipy seaborn sympy tabulate watchdog websockets yt-dlp
 
 ENV PATH="${CARGO_HOME}/bin:/usr/games:${PATH}"
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
