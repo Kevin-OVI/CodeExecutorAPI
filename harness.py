@@ -197,6 +197,53 @@ async def check_ephemeral_execute(session: aiohttp.ClientSession, api_url: str) 
     assert result["return_code"] == 0, f"Ephemeral execute failed: {result}"
 
 
+async def check_javascript_module_styles(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
+    snippets = {
+        "commonjs": "const os = require('node:os'); console.log('ok', typeof os.platform);",
+        "esm": "import os from 'node:os'; console.log('ok', typeof os.platform);",
+        "top-level await": "console.log('ok', await Promise.resolve('typeof'));",
+    }
+    for style, code in snippets.items():
+        result = await _execute(session, api_url, "javascript", code, session_id=session_id)
+        assert result["return_code"] == 0 and "ok" in result["output"], f"javascript {style} failed: {result}"
+        print(f"Execute javascript ({style}) -> {result['output']!r}")
+
+    result = await _execute(
+        session, api_url, "javascript",
+        "const fs = require('node:fs'); console.log(fs.readFileSync('./sibling.txt', 'utf8').trim());",
+        session_id=session_id, attachments={"sibling.txt": b"read from the session directory"},
+    )
+    assert result["return_code"] == 0 and "read from the session directory" in result["output"], (
+        f"javascript could not read a session file through a relative path: {result}"
+    )
+    print(f"Execute javascript (relative path into the session dir) -> {result['output']!r}")
+
+
+async def check_typescript(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
+    snippets = {
+        "annotations": "import os from 'node:os';\nconst platform: string = os.platform();\nconsole.log('ok', platform.length > 0);",
+        "commonjs": "const os = require('node:os');\ninterface Info { name: string }\nconst info: Info = { name: os.platform() };\nconsole.log('ok', info.name.length > 0);",
+        # `enum` is not erasable syntax, so it only works because tsx transpiles rather
+        # than relying on Node's native type stripping.
+        "enum": "enum Level { Low, High }\nconsole.log('ok', Level[Level.High] === 'High');",
+    }
+    for style, code in snippets.items():
+        result = await _execute(session, api_url, "typescript", code, session_id=session_id)
+        assert result["return_code"] == 0 and "ok true" in result["output"], f"typescript {style} failed: {result}"
+        assert not result["files"], f"typescript {style} left files behind in the session: {sorted(result['files'])}"
+        print(f"Execute typescript ({style}) -> {result['output']!r}")
+
+    result = await _execute(
+        session, api_url, "typescript",
+        "import { greeting } from './greeter.ts';\nconsole.log(greeting);",
+        session_id=session_id, attachments={"greeter.ts": b"export const greeting: string = 'imported from the session';"},
+    )
+    assert result["return_code"] == 0 and "imported from the session" in result["output"], (
+        f"typescript could not import a session module through a relative specifier: {result}"
+    )
+    print(f"Execute typescript (relative import from the session dir) -> {result['output']!r}")
+
+
 async def check_error_cases(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
     async with session.get(f"{api_url}/sessions/does-not-exist/files/hello.txt") as response:
         assert response.status == 404, f"Expected 404 for unknown session, got {response.status}"
@@ -236,6 +283,8 @@ async def run(api_url: str, *, check_quota: bool, max_session_size: int) -> None
         else:
             print("Skipping disk quota check (pass --check-quota once SESSION_QUOTA_MOUNTPOINT is configured)")
         await check_rejected_execute_leaves_no_attachment(session, api_url, session_id)
+        await check_javascript_module_styles(session, api_url, session_id)
+        await check_typescript(session, api_url, session_id)
         await check_ephemeral_execute(session, api_url)
         await check_error_cases(session, api_url, session_id)
 

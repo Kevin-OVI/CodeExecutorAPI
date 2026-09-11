@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
   apt update && \
   apt install -y dotnet-sdk-10.0 nodejs openjdk-25-jdk-headless
 
-RUN npm install -g typescript tsx
+RUN npm install -g tsx
 
 RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \

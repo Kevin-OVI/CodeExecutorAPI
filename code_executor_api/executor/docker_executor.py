@@ -34,9 +34,8 @@ LOGGER = logging.getLogger(__name__)
 COMMANDS: dict[str, Iterable[str]] = {
     "python": ("python", "-c"),
     "bash": ("bash", "-c"),
-    "javascript": ("node", "--input-type=module", "--eval"),
-    "node": ("/executors/node.sh",),
-    "typescript": ("/executors/typescript.sh",),
+    "javascript": ("node", "--eval"),
+    "typescript": ("tsx", "--eval"),
     "c": ("/executors/c.sh",),
     "cpp": ("/executors/cpp.sh",),
     "java": ("/executors/java.sh",),
