@@ -20,12 +20,12 @@ from ..config import (
     CONTAINER_TMPFS_SIZE,
     CONTAINER_ULIMIT_FSIZE,
     CONTAINER_ULIMIT_NOFILE,
-    DOCKER_CHECK_TIMEOUT_SECONDS,
-    DOCKER_IMAGE,
     EXECUTION_TIMEOUT,
     MAX_CPU_CORES,
     MAX_MEMORY,
     MAX_OUTPUT_SIZE,
+    PODMAN_CHECK_TIMEOUT_SECONDS,
+    PODMAN_IMAGE,
 )
 from ..sessions import Session
 
@@ -141,14 +141,14 @@ def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event,
 async def _remove_container(container_name: str) -> bool:
     try:
         process = await asyncio.create_subprocess_exec(
-            "docker", "rm", "--force", container_name,
+            "podman", "rm", "--force", container_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
     except OSError:
         return False
     try:
-        return_code = await asyncio.wait_for(process.wait(), timeout=DOCKER_CHECK_TIMEOUT_SECONDS)
+        return_code = await asyncio.wait_for(process.wait(), timeout=PODMAN_CHECK_TIMEOUT_SECONDS)
     except TimeoutError:
         process.kill()
         await process.wait()
@@ -204,7 +204,7 @@ class ExecutionEnvironment:
             command = COMMANDS[self.language]
             current_niceness = os.nice(0)
             process = await asyncio.create_subprocess_exec(
-                "docker", "run",
+                "podman", "run",
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
@@ -222,7 +222,7 @@ class ExecutionEnvironment:
                 f"--cpus={MAX_CPU_CORES}",
                 "--volume", f"{self.session.work_directory}:/app/",
                 "--name", self.container_name,
-                DOCKER_IMAGE,
+                PODMAN_IMAGE,
                 "nice", "-n", str(current_niceness + CONTAINER_RELATIVE_NICENESS),
                 *command, self.code,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
@@ -233,7 +233,7 @@ class ExecutionEnvironment:
                 timed_out = True
         finally:
             if process is not None and process.returncode is None:
-                # `docker run --rm` already cleans up on a normal exit; only a still-running
+                # `podman run --rm` already cleans up on a normal exit; only a still-running
                 # (timed-out) container needs to be force-removed here.
                 removed = await _remove_container(self.container_name)
                 if not removed:

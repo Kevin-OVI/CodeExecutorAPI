@@ -1,6 +1,7 @@
-# syntax=docker/dockerfile:1
-FROM python:3.14.7-trixie
+FROM docker.io/library/python:3.14.7-trixie
 
+# `docker-clean` is the literal name of the apt config shipped by the base image; dropping it
+# (and keeping downloaded packages) is what makes the apt cache mounts below effective.
 RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 

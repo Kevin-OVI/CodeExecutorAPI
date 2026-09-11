@@ -1,11 +1,11 @@
-# Code Executor API (aiohttp + Docker)
+# Code Executor API (aiohttp + Podman)
 
-Code Executor API runs untrusted code inside hardened, ephemeral Docker containers (no capabilities, read-only root, resource limits) and exposes the result over HTTP. Callers manage a persistent **session** (a server-side working directory) so files can be created, read, and deleted across multiple executions without re-uploading a whole directory snapshot each time.
+Code Executor API runs untrusted code inside hardened, ephemeral Podman containers (no capabilities, read-only root, resource limits) and exposes the result over HTTP. Callers manage a persistent **session** (a server-side working directory) so files can be created, read, and deleted across multiple executions without re-uploading a whole directory snapshot each time.
 
 ## Features
 
 - `aiohttp` API with session management (`/sessions`), per-file access (`/sessions/{id}/files/{path}`), code execution (`/execute` and `/sessions/{id}/execute`), and `/health`
-- Sandboxed execution via `docker run` with CPU/memory/pid/ulimit caps and a hard wall-clock timeout
+- Sandboxed execution via `podman run` with CPU/memory/pid/ulimit caps and a hard wall-clock timeout
 - Supports python, bash, javascript, c, c++, java, c#, rust
 - Sessions persist a working directory across executions, guarded by a per-session lock; idle sessions expire automatically
 - `execute` reports exactly what changed: created/modified files (returned as multipart attachments) and deleted files
@@ -13,11 +13,23 @@ Code Executor API runs untrusted code inside hardened, ephemeral Docker containe
 ## Requirements
 
 - Python 3.12+
-- Docker
-- A Docker image must be created before starting the API using `Dockerfile`
-  ```cmd
-  docker build -t code_executor executor_image
+- Podman (the `podman` CLI must be on the API process's `PATH`)
+- The sandbox image must be built before starting the API, using `Containerfile`
+  ```bash
+  podman build -t code_executor executor_image
   ```
+
+The API shells out to `podman run` as the user running the service, so that user needs a working
+Podman setup (rootful, or rootless with lingering enabled if the service is not started from a
+login session). Two rootless-specific notes:
+
+- Session working directories are bind-mounted into the container. Under rootless Podman the
+  container's `appuser` is mapped into the caller's subuid range, not to the host user, so the
+  executor's existing `0666`/`0777` bits on session files are what keep them writable from inside
+  the container. If you prefer identity mapping instead, add `--userns=keep-id` to the `podman run`
+  invocation in `code_executor_api/executor/podman_executor.py`.
+- On SELinux-enforcing hosts, bind mounts need a relabel: append `:Z` to the `--volume` argument in
+  the same file.
 
 ## Setup
 
@@ -37,7 +49,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `MAX_MEMORY` (default: `256M`)
 - `MAX_CPU_CORES` (default: `1`)
 - `MAX_OUTPUT_SIZE` (default: `10485760` bytes)
-- `MAX_CODE_LENGTH` (default: `65536` bytes) - must stay below the kernel's `MAX_ARG_STRLEN` (128 KiB) since code is passed as a single `docker run` argv entry
+- `MAX_CODE_LENGTH` (default: `65536` bytes) - must stay below the kernel's `MAX_ARG_STRLEN` (128 KiB) since code is passed as a single `podman run` argv entry
 - `MAX_SESSION_SIZE` (default: `104857600` bytes)
 - `MAX_SESSIONS` (default: `64`)
 - `MAX_CONCURRENT_EXECUTIONS` (default: `4`)
@@ -46,15 +58,15 @@ The service reads these environment variables at import/startup (see `code_execu
 - `CONTAINER_ULIMIT_FSIZE` (default: `268435456` bytes)
 - `CONTAINER_RELATIVE_NICENESS` (default: `5`)
 - `CONTAINER_TMPFS_SIZE` (default: `64m`)
-- `DOCKER_IMAGE` (default: `code_executor`)
-- `DOCKER_CHECK_TIMEOUT_SECONDS` (default: `5`)
+- `PODMAN_IMAGE` (default: `code_executor`)
+- `PODMAN_CHECK_TIMEOUT_SECONDS` (default: `5`)
 - `SESSION_INACTIVITY_TIMEOUT_SECONDS` (default: `1800`) - idle sessions are deleted after this long
 - `SESSION_SWEEP_INTERVAL_SECONDS` (default: `60`) - how often the expiry sweep runs
 - `SESSION_LOCK_WAIT_TIMEOUT_SECONDS` (default: `30`) - how long a request waits for a session's lock (or an execution slot) before returning `409`/`503`
 - `SESSION_ROOT_DIRECTORY` (default: the system temporary directory) - base directory for session working directories
 - `SESSION_QUOTA_MOUNTPOINT` (default: unset) - XFS mountpoint containing `SESSION_ROOT_DIRECTORY`; when set, `MAX_SESSION_SIZE` is enforced as a hard, kernel-level XFS project quota per session (see below). When unset, `MAX_SESSION_SIZE` is only enforced against host-mediated writes (`PUT`/seed/attachment uploads) - code running inside the container can otherwise write past it, bounded only by `CONTAINER_ULIMIT_FSIZE` per file and `EXECUTION_TIMEOUT`
 
-Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`DOCKER_IMAGE` via its own environment.
+Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE` via its own environment.
 
 ### Enforcing `MAX_SESSION_SIZE` with an XFS project quota
 
@@ -177,9 +189,9 @@ Runs a broad set of smoke checks against a running server: session/file lifecycl
 - `code_executor_api/validation.py` - sub_path normalization, language/null-byte validation
 - `code_executor_api/file_helpers.py` - size-limited streaming reads/writes shared by sessions and file uploads
 - `code_executor_api/sessions.py` - `Session`/`SessionManager`: locking, creation/deletion, expiry sweep, and (when `SESSION_QUOTA_MOUNTPOINT` is set) per-session XFS project quota setup
-- `code_executor_api/executor/docker_executor.py` - Docker container invocation and file-diffing
+- `code_executor_api/executor/podman_executor.py` - Podman container invocation and file-diffing
 - `code_executor_api/routes/` - `/sessions`, `/sessions/{id}/files/{path}`, `/execute` (and `/sessions/{id}/execute`), `/health` handlers
-- `executor_image/` - `Dockerfile` and per-language `executors/*.sh` scripts for the sandbox image (Python, Bash, Node.js, GCC/G++, JDK, .NET SDK, Rust toolchain)
+- `executor_image/` - `Containerfile` and per-language `executors/*.sh` scripts for the sandbox image (Python, Bash, Node.js, GCC/G++, JDK, .NET SDK, Rust toolchain)
 
 ## Dependencies
 
