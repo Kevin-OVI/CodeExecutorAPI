@@ -21,7 +21,7 @@ RUN wget https://packages.microsoft.com/config/debian/13/packages-microsoft-prod
 
 RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
   --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \
-  (curl -fsSL https://deb.nodesource.com/setup_24.x | bash) && \
+  (curl -fsSL https://deb.nodesource.com/setup_26.x | bash) && \
   apt update && \
   apt install -y dotnet-sdk-10.0 nodejs openjdk-25-jdk-headless
 
