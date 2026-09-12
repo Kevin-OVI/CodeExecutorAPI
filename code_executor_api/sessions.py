@@ -231,10 +231,10 @@ class Session:
                     raise IsADirectoryError(normalised_sub_path)
                 if not stat.S_ISREG(file_mode):
                     raise FileNotFoundError(normalised_sub_path)
-                return read_file(fd, filename=normalised_sub_path, field_name=field_name)
             except BaseException:
                 os.close(fd)
                 raise
+            return read_file(fd, filename=normalised_sub_path, field_name=field_name)
 
     def list_directory(self, sub_path: str) -> dict[str, Any]:
         """List one directory level, without following symlinks anywhere along the path.
@@ -325,7 +325,7 @@ class Session:
             self.files_size.pop(normalised_sub_path, None)
 
     def get_sub_path(self, full_path: str):
-        normalised_path = posixpath.normpath(full_path.replace("\\", "/"))
+        normalised_path = posixpath.normpath(full_path)
         if not normalised_path.startswith(self.work_directory + "/"):
             raise ValueError(f"Path {normalised_path!r} is not within the session directory ({self.work_directory!r})")
         return normalised_path[len(self.work_directory) + 1:]
@@ -416,22 +416,29 @@ class SessionManager:
 
     async def _sweep_once(self) -> None:
         now = time.monotonic()
-        expired_sessions: list[Session] = []
-        for session in self._sessions.values():
+        for session in list(self._sessions.values()):
             if not await _try_acquire_lock(session.lock):
                 continue
-            if now - session.last_used <= SESSION_INACTIVITY_TIMEOUT_SECONDS:
-                session.lock.release()
-                continue
-            expired_sessions.append(session)
-
-        for session in expired_sessions:
             try:
-                await self._delete(session)
+                if self._sessions.get(session.id) is not session:
+                    continue
+                if now - session.last_used <= SESSION_INACTIVITY_TIMEOUT_SECONDS:
+                    continue
+                deletion = asyncio.create_task(self._delete(session))
+                try:
+                    await asyncio.shield(deletion)
+                except asyncio.CancelledError:
+                    # Cancelling the await cannot stop rmtree's worker thread. Keep the
+                    # session locked until deletion finishes, including during shutdown.
+                    with contextlib.suppress(Exception):
+                        await deletion
+                    raise
             except Exception as e:
                 LOGGER.exception("Failed to sweep expired session %s", session.id, exc_info=e)
             else:
                 LOGGER.info("Swept expired session %s", session.id)
+            finally:
+                session.lock.release()
 
     async def _sweep_loop(self) -> None:
         while True:

@@ -75,7 +75,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `MAX_CODE_LENGTH` (default: `65536` bytes) - must stay below the kernel's `MAX_ARG_STRLEN` (128 KiB) since code is passed as a single `podman run` argv entry
 - `MAX_SESSION_SIZE` (default: `104857600` bytes)
 - `MAX_SESSION_ENTRIES` (default: `32768`) - maximum inodes (files, directories and symlinks alike) a session may hold, enforced as the XFS project quota's `ihard` alongside `MAX_SESSION_SIZE`; like the byte limit it only applies when `SESSION_QUOTA_MOUNTPOINT` is set. Creating past it fails inside the container the same way running out of disk does. Keep it comfortably above what a real workload installs - a scientific Python stack is roughly 15000 inodes
-- `MAX_RESULT_ATTACHMENTS` (default: `256`) - maximum changed files returned as `/execute` response parts. Anything beyond that is named in the response's `omitted_files` and stays retrievable through the files API; execution itself is never failed over this
+- `MAX_RESULT_ATTACHMENTS` (default: `256`) - maximum changed files returned as `/execute` response parts. Anything beyond that is named in the response's `omitted_files`; readable files remain retrievable through the files API while a persistent session is live. Omitted files from a throwaway `/execute` session are not retrievable after the call; execution itself is never failed over this
 - `MAX_SESSIONS` (default: `64`)
 - `MAX_CONCURRENT_EXECUTIONS` (default: `4`)
 - `CONTAINER_PIDS_LIMIT` (default: `128`)
@@ -205,6 +205,7 @@ curl -X DELETE http://127.0.0.1:40003/sessions/{session_id}/files/some/path.txt
 
 - `GET`/`PUT`/`DELETE` on a file return `404` if the session or file doesn't exist.
 - `PUT` creates or overwrites the file (parent directories are created as needed); the request body is the raw file bytes.
+- Paths use Linux separators: `/` separates directories, while `\` is a literal character in a filename, not an alias for `/`.
 - `GET` on a **directory** returns a JSON listing of that one level instead of file bytes; an empty path lists the session root. Unlike execution results the listing hides nothing - hidden directories and symlinks are included - so it is the way to discover files that `/execute` excluded or omitted. Symlinks are reported, never followed.
 
 ```json
@@ -246,7 +247,7 @@ Read `filename*` (aiohttp's `part.filename` already prefers it) to get the exact
 
 Notes on what counts as changed:
 
-- `omitted_files` names the changed files that did not fit under `MAX_RESULT_ATTACHMENTS` (or that could not be read back). The run still succeeded; fetch them individually with `GET /sessions/{id}/files/{path}`. `deleted_files` is never truncated.
+- `omitted_files` names the changed files that did not fit under `MAX_RESULT_ATTACHMENTS` (or that could not be read back, including filenames not representable as UTF-8). The run still succeeded. Readable files in a live persistent session can be fetched individually with `GET /sessions/{id}/files/{path}`; a throwaway `/execute` session is destroyed after the call, so its omitted files cannot be fetched later. `deleted_files` is never truncated.
 - Change detection compares `(inode, size, mtime, ctime)` rather than hashing contents, so rewriting a file with byte-identical content counts as a modification and comes back as an attachment.
 - Hidden directories are excluded at every depth. The session directory is also the container's `$HOME`, so `.cache`, `.local`, `.npm` and the like would otherwise flood the response with package-manager noise. They still occupy the session's byte and inode quotas, and are still visible through the files API.
 
