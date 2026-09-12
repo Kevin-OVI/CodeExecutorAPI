@@ -51,6 +51,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `MAX_OUTPUT_SIZE` (default: `10485760` bytes)
 - `MAX_CODE_LENGTH` (default: `65536` bytes) - must stay below the kernel's `MAX_ARG_STRLEN` (128 KiB) since code is passed as a single `podman run` argv entry
 - `MAX_SESSION_SIZE` (default: `104857600` bytes)
+- `MAX_SESSION_ENTRIES` (default: `1024`) - maximum files, directories and other entries scanned before and after execution, excluding the root `.cache` directory; exceeding this stops collection and returns `413` instead of a partial result
 - `MAX_SESSIONS` (default: `64`)
 - `MAX_CONCURRENT_EXECUTIONS` (default: `4`)
 - `CONTAINER_PIDS_LIMIT` (default: `128`)

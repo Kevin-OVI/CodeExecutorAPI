@@ -24,10 +24,11 @@ from ..config import (
     MAX_CPU_CORES,
     MAX_MEMORY,
     MAX_OUTPUT_SIZE,
+    MAX_SESSION_ENTRIES,
     PODMAN_CHECK_TIMEOUT_SECONDS,
     PODMAN_IMAGE,
 )
-from ..sessions import Session
+from ..sessions import Session, SessionResourceLimitReached
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +91,30 @@ def _open_regular_file(path: str, mode: int | None = None):
         raise
     with os.fdopen(fd, "rb") as f:
         yield f, file_stat.st_size
+
+
+def _walk_session(work_directory: str):
+    pending = [work_directory]
+    count = 0
+    while pending:
+        directory = pending.pop()
+        directories, files = [], []
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if directory == work_directory and entry.name == ".cache" and entry.is_dir(follow_symlinks=False):
+                        continue
+                    count += 1
+                    if count > MAX_SESSION_ENTRIES:
+                        raise SessionResourceLimitReached("Session file count limit reached")
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append(entry.name)
+                    else:
+                        files.append(entry.name)
+        except OSError:
+            continue
+        yield directory, directories, files
+        pending.extend(os.path.join(directory, name) for name in directories)
 
 
 def _hash(f) -> bytes:
@@ -171,10 +196,7 @@ class ExecutionEnvironment:
 
         self.input_files_hashes: dict[str, tuple[int, bytes]] = {}
 
-        for directory, directories, files in os.walk(session.work_directory):
-            if directory == session.work_directory:
-                with contextlib.suppress(ValueError):
-                    directories.remove(".cache")
+        for directory, directories, files in _walk_session(session.work_directory):
             try:
                 _chmod_directory(directory)
             except OSError:
@@ -262,11 +284,7 @@ class ExecutionEnvironment:
         attachments = []
         seen_sub_paths = set()
         files_size: dict[str, int] = {}
-        for directory, directories, files in os.walk(self.session.work_directory):
-            if directory == self.session.work_directory:
-                with contextlib.suppress(ValueError):
-                    directories.remove(".cache")
-
+        for directory, directories, files in _walk_session(self.session.work_directory):
             for file in files:
                 full_path = os.path.join(directory, file)
 

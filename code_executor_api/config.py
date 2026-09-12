@@ -43,6 +43,7 @@ MAX_CPU_CORES = _read_int_env("MAX_CPU_CORES", 1, min_value=1)
 MAX_OUTPUT_SIZE = _read_int_env("MAX_OUTPUT_SIZE", 10 * 1024 * 1024, min_value=1)  # bytes
 MAX_CODE_LENGTH = _read_int_env("MAX_CODE_LENGTH", 64 * 1024, min_value=1)  # bytes, must stay below the kernel's MAX_ARG_STRLEN (128 KiB) since code is passed as a single `podman run` argv entry
 MAX_SESSION_SIZE = _read_int_env("MAX_SESSION_SIZE", 100 * 1024 * 1024, min_value=1)  # bytes
+MAX_SESSION_ENTRIES = _read_int_env("MAX_SESSION_ENTRIES", 1024, min_value=1)
 MAX_SESSIONS = _read_int_env("MAX_SESSIONS", 64, min_value=1)
 MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_value=1)
 CONTAINER_PIDS_LIMIT = _read_int_env("CONTAINER_PIDS_LIMIT", 128, min_value=1)
