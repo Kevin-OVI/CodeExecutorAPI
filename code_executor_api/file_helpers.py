@@ -3,11 +3,14 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import re
 import secrets
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
+from urllib.parse import quote
 
 from aiofiles import open as aopen
 from aiohttp import BodyPartReader, IOBasePayload, StreamReader
+from aiohttp.hdrs import CONTENT_DISPOSITION
 from aiohttp.web import HTTPRequestEntityTooLarge
 
 type _Reader = Callable[[int], Awaitable[bytes]]
@@ -129,32 +132,40 @@ async def write_file_to_temp(
     return temporary_name, size
 
 
-async def write_file_at_content(
-        parent_fd: int,
-        filename: str,
-        content: SupportedContentType,
-        max_size: int,
-        size_limiter: ContentSizeLimiter | None = None,
-) -> int:
-    temporary_name, size = await write_file_to_temp(parent_fd, content, max_size, size_limiter)
-    try:
-        os.replace(temporary_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary_name, dir_fd=parent_fd)
-    return size
+_NON_ASCII_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _content_disposition(sub_path: str, field_name: str | None) -> str:
+    """Build a `Content-Disposition` that can carry a full session sub_path.
+
+    A plain `filename` cannot portably hold one: RFC 6266 tells recipients to strip
+    directory components, and percent-escapes have no defined meaning there, so a client
+    reading `filename="out%2Ff.txt"` gets that string literally. The exact sub_path
+    therefore goes in the RFC 5987 `filename*` extended parameter - which clients decode
+    back to `out/f.txt` - and `filename` keeps a flattened ASCII fallback for clients that
+    only understand it.
+
+    `filename*` percent-encodes everything outside the unreserved set, so a name chosen by
+    executed code cannot smuggle a quote or a CRLF into the header.
+    """
+    fallback = _NON_ASCII_FILENAME.sub("_", sub_path.replace("/", "_")) or "attachment"
+    parameters = [f'filename="{fallback}"', f"filename*=UTF-8''{quote(sub_path, safe='')}"]
+    if field_name is not None:
+        parameters.insert(0, f'name="{field_name}"')
+    return "; ".join(["attachment", *parameters])
 
 
 def read_file(fd: int, *, filename: str | None = None, field_name: str | None = None) -> IOBasePayload:
-    kwargs: dict[str, Any] = {}
-    if filename is not None:
-        kwargs["filename"] = filename
     f = os.fdopen(fd, "rb")  # Will be closed automatically by IOBasePayload
     try:
-        payload = IOBasePayload(f, **kwargs)
+        # The filename is passed to the payload so it can guess a Content-Type from the
+        # extension; the disposition header it derives from it is replaced below.
+        payload = IOBasePayload(f, filename=filename) if filename is not None else IOBasePayload(f)
     except BaseException:
         f.close()
         raise
-    if field_name is not None:
-        payload.set_content_disposition("attachment", **kwargs, name=field_name)
+    if filename is not None:
+        payload.headers[CONTENT_DISPOSITION] = _content_disposition(filename, field_name)
+    elif field_name is not None:
+        payload.set_content_disposition("attachment", name=field_name)
     return payload

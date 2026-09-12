@@ -1,4 +1,16 @@
 import os
+import shlex
+
+
+def _read_argv_env(name: str, default: str) -> tuple[str, ...]:
+    """Read a command line into an argv tuple, so it can be exec'd without a shell."""
+    try:
+        argv = tuple(shlex.split(_read_str_env(name, default)))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid command line: {exc}") from exc
+    if not argv:
+        raise ValueError(f"{name} must not be empty.")
+    return argv
 
 
 def _read_str_env(name: str, default: str) -> str:
@@ -43,9 +55,12 @@ MAX_CPU_CORES = _read_int_env("MAX_CPU_CORES", 1, min_value=1)
 MAX_OUTPUT_SIZE = _read_int_env("MAX_OUTPUT_SIZE", 10 * 1024 * 1024, min_value=1)  # bytes
 MAX_CODE_LENGTH = _read_int_env("MAX_CODE_LENGTH", 64 * 1024, min_value=1)  # bytes, must stay below the kernel's MAX_ARG_STRLEN (128 KiB) since code is passed as a single `podman run` argv entry
 MAX_SESSION_SIZE = _read_int_env("MAX_SESSION_SIZE", 100 * 1024 * 1024, min_value=1)  # bytes
+MAX_SESSION_ENTRIES = _read_int_env("MAX_SESSION_ENTRIES", 32768, min_value=1)  # inodes (files + directories + symlinks), enforced as the XFS project quota's `ihard` and therefore only when SESSION_QUOTA_MOUNTPOINT is set
+MAX_RESULT_ATTACHMENTS = _read_int_env("MAX_RESULT_ATTACHMENTS", 256, min_value=1)  # changed files returned as `/execute` response parts; the rest are listed in `omitted_files`
 MAX_SESSIONS = _read_int_env("MAX_SESSIONS", 64, min_value=1)
 MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_value=1)
 CONTAINER_PIDS_LIMIT = _read_int_env("CONTAINER_PIDS_LIMIT", 128, min_value=1)
+CONTAINER_USER_ID = _read_int_env("CONTAINER_USER_ID", 4000, min_value=1)  # uid *and* gid of `appuser` in PODMAN_IMAGE; must match the Containerfile, since `--userns=keep-id` maps the host service account onto it
 CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_value=1)
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 256 * 1024 * 1024, min_value=1)  # bytes
 CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)
@@ -58,3 +73,4 @@ SESSION_SWEEP_INTERVAL_SECONDS = _read_int_env("SESSION_SWEEP_INTERVAL_SECONDS",
 SESSION_LOCK_WAIT_TIMEOUT_SECONDS = _read_int_env("SESSION_LOCK_WAIT_TIMEOUT_SECONDS", 30, min_value=1)
 SESSION_ROOT_DIRECTORY = _read_optional_str_env("SESSION_ROOT_DIRECTORY")
 SESSION_QUOTA_MOUNTPOINT = _read_optional_str_env("SESSION_QUOTA_MOUNTPOINT")  # XFS mountpoint (containing SESSION_ROOT_DIRECTORY) to enforce MAX_SESSION_SIZE via a per-session XFS project quota; unset disables quota enforcement
+SESSION_QUOTA_COMMAND = _read_argv_env("SESSION_QUOTA_COMMAND", "xfs_quota")  # argv prefix used to run xfs_quota; set to e.g. "sudo -n /usr/sbin/xfs_quota" when the API runs unprivileged and CAP_SYS_ADMIN is delegated through a scoped sudoers rule

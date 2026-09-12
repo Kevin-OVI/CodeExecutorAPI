@@ -3,7 +3,7 @@ import logging
 
 from aiohttp import MultipartWriter, web
 
-from ..config import MAX_CODE_LENGTH, MAX_SESSION_SIZE
+from ..config import MAX_CODE_LENGTH, MAX_RESULT_ATTACHMENTS, MAX_SESSION_SIZE
 from ..executor import run_code_async
 from ..file_helpers import ContentSizeLimiter, read_content
 from ..sessions import (
@@ -74,6 +74,26 @@ async def handle_execute(request: web.Request) -> web.Response:
             async with session_manager.execution_slot():
                 result = await run_code_async(session, language, code)
 
+                # Split the run's changed files into what this response carries and what it
+                # only names. Everything is opened up front because the JSON part comes first
+                # and has to already know the final omitted list, so a file that turns out to
+                # be unreadable has to be discovered before that part is written.
+                #
+                # `changed_files` is sorted, so the cut is deterministic and `omitted_files`
+                # comes out sorted too. An unreadable file does not consume an attachment
+                # slot, so a full response still carries MAX_RESULT_ATTACHMENTS files.
+                payloads = []
+                omitted_files = []
+                for sub_path in result.changed_files:
+                    if len(payloads) >= MAX_RESULT_ATTACHMENTS:
+                        omitted_files.append(sub_path)
+                        continue
+                    try:
+                        payloads.append(session.read_file(sub_path, field_name="attachments"))
+                    except OSError:
+                        LOGGER.warning("Omitting unreadable result attachment %s", sub_path)
+                        omitted_files.append(sub_path)
+
                 with MultipartWriter("mixed") as mpwriter:
                     result_payload = mpwriter.append_json(
                         {
@@ -82,11 +102,12 @@ async def handle_execute(request: web.Request) -> web.Response:
                             "execution_time": result.execution_result.execution_time,
                             "timed_out": result.execution_result.timed_out,
                             "deleted_files": result.deleted_files,
+                            "omitted_files": omitted_files,
                         },
                     )
                     result_payload.set_content_disposition("inline", name="result")
-                    for attachment in result.attachments:
-                        mpwriter.append_payload(session.read_file(attachment.sub_path, field_name="attachments"))
+                    for payload in payloads:
+                        mpwriter.append_payload(payload)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
     except SessionLockTimeout:

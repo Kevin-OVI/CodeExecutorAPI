@@ -19,8 +19,14 @@ async def handle_get_file(request: web.Request) -> web.Response:
     try:
         async with session_manager.locked(session_id) as session:
             try:
-                content = session.read_file(sub_path)
-            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+                if not sub_path.strip("/"):
+                    # An empty path is the session root, which is always a directory.
+                    return web.json_response(session.list_directory(sub_path))
+                try:
+                    content = session.read_file(sub_path)
+                except IsADirectoryError:
+                    return web.json_response(session.list_directory(sub_path))
+            except (FileNotFoundError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
     except SessionNotFound:
         return web.json_response({"error": "Session not found"}, status=404)
