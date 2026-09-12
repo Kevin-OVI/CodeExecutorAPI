@@ -156,16 +156,21 @@ def _content_disposition(sub_path: str, field_name: str | None) -> str:
 
 
 def read_file(fd: int, *, filename: str | None = None, field_name: str | None = None) -> IOBasePayload:
-    f = os.fdopen(fd, "rb")  # Will be closed automatically by IOBasePayload
+    """Take ownership of fd, closing it if payload preparation fails."""
+    f = None
     try:
+        f = os.fdopen(fd, "rb")  # Will be closed automatically by IOBasePayload
         # The filename is passed to the payload so it can guess a Content-Type from the
         # extension; the disposition header it derives from it is replaced below.
         payload = IOBasePayload(f, filename=filename) if filename is not None else IOBasePayload(f)
+        if filename is not None:
+            payload.headers[CONTENT_DISPOSITION] = _content_disposition(filename, field_name)
+        elif field_name is not None:
+            payload.set_content_disposition("attachment", name=field_name)
+        return payload
     except BaseException:
-        f.close()
+        if f is None:
+            os.close(fd)
+        else:
+            f.close()
         raise
-    if filename is not None:
-        payload.headers[CONTENT_DISPOSITION] = _content_disposition(filename, field_name)
-    elif field_name is not None:
-        payload.set_content_disposition("attachment", name=field_name)
-    return payload

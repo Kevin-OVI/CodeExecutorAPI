@@ -90,7 +90,7 @@ async def handle_execute(request: web.Request) -> web.Response:
                         continue
                     try:
                         payloads.append(session.read_file(sub_path, field_name="attachments"))
-                    except OSError:
+                    except (OSError, UnicodeError):
                         LOGGER.warning("Omitting unreadable result attachment %s", sub_path)
                         omitted_files.append(sub_path)
 
