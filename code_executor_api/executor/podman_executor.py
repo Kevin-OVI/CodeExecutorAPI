@@ -1,7 +1,5 @@
 import asyncio
-import contextlib
 import errno
-import hashlib
 import io
 import logging
 import os
@@ -12,7 +10,7 @@ import stat
 import threading
 import time
 from contextlib import suppress
-from typing import Iterable, NamedTuple
+from typing import Iterable, Iterator, NamedTuple
 
 from ..config import (
     CONTAINER_PIDS_LIMIT,
@@ -20,15 +18,15 @@ from ..config import (
     CONTAINER_TMPFS_SIZE,
     CONTAINER_ULIMIT_FSIZE,
     CONTAINER_ULIMIT_NOFILE,
+    CONTAINER_USER_ID,
     EXECUTION_TIMEOUT,
     MAX_CPU_CORES,
     MAX_MEMORY,
     MAX_OUTPUT_SIZE,
-    MAX_SESSION_ENTRIES,
     PODMAN_CHECK_TIMEOUT_SECONDS,
     PODMAN_IMAGE,
 )
-from ..sessions import Session, SessionResourceLimitReached
+from ..sessions import Session
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,14 +50,9 @@ class ExecutionResult(NamedTuple):
     timed_out: bool
 
 
-class ResultAttachment(NamedTuple):
-    sub_path: str
-    absolute_path: str
-
-
 class CodeExecutionResult(NamedTuple):
     execution_result: ExecutionResult
-    attachments: list[ResultAttachment]
+    changed_files: list[str]
     deleted_files: list[str]
 
 
@@ -70,72 +63,46 @@ def _close_noerror(fd: int):
         pass
 
 
-@contextlib.contextmanager
-def _open_regular_file(path: str, mode: int | None = None):
-    """Open a file for reading, refusing to follow symlinks, as a plain binary file object.
+def _iter_session_files(work_directory: str) -> Iterator[tuple[str, os.stat_result]]:
+    """Yield `(sub_path, lstat)` for every regular file in the session.
 
-    The builtin `open()`/`pathlib` cannot refuse to follow a symlink, so a raw
-    `O_NOFOLLOW` open is unavoidable here; it is confined to this one helper, which
-    yields a normal file object (plus its size) once the target is verified regular.
+    Hidden directories are skipped at any depth: the session directory doubles as the
+    container's `$HOME`, so `.cache`, `.local`, `.npm` and friends fill up with package
+    manager noise that is never a meaningful execution result.
+
+    Symlinks and other non-regular entries are never yielded, so they can be neither
+    reported as results nor followed off the session tree.
     """
-    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(path, flags)
-    try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OSError(errno.EINVAL, "Not a regular file", path)
-        if mode is not None:
-            os.fchmod(fd, mode)
-    except BaseException:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, "rb") as f:
-        yield f, file_stat.st_size
-
-
-def _walk_session(work_directory: str):
+    prefix_length = len(work_directory) + 1
     pending = [work_directory]
-    count = 0
     while pending:
         directory = pending.pop()
-        directories, files = [], []
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if directory == work_directory and entry.name == ".cache" and entry.is_dir(follow_symlinks=False):
-                        continue
-                    count += 1
-                    if count > MAX_SESSION_ENTRIES:
-                        raise SessionResourceLimitReached("Session file count limit reached")
                     if entry.is_dir(follow_symlinks=False):
-                        directories.append(entry.name)
-                    else:
-                        files.append(entry.name)
-        except OSError:
+                        if not entry.name.startswith("."):
+                            pending.append(entry.path)
+                        continue
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISREG(entry_stat.st_mode):
+                        yield entry.path[prefix_length:], entry_stat
+        except OSError as exc:
+            LOGGER.debug("Skipping unreadable session directory %s: %s", directory, exc)
             continue
-        yield directory, directories, files
-        pending.extend(os.path.join(directory, name) for name in directories)
 
 
-def _hash(f) -> bytes:
-    sha256 = hashlib.sha256()
-    for chunk in iter(lambda: f.read(4096), b""):
-        sha256.update(chunk)
-    return sha256.digest()
+def _signature(entry_stat: os.stat_result) -> tuple[int, int, int, int]:
+    """Cheap change-detection stamp for a regular file.
 
-
-def _hash_file(path: str, mode: int | None = None) -> tuple[int, bytes]:
-    with _open_regular_file(path, mode) as (f, size):
-        return size, _hash(f)
-
-
-def _chmod_directory(path: str) -> None:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(path, flags)
-    try:
-        os.fchmod(fd, 0o777)
-    finally:
-        os.close(fd)
+    Replaces hashing the file's contents: one `lstat` instead of a full read. `st_ino`
+    catches a delete-and-recreate, and `st_ctime_ns` catches an `mtime` rewound with
+    `utimensat` (which bumps `ctime` itself) as well as any metadata-only change.
+    """
+    return (entry_stat.st_ino, entry_stat.st_size, entry_stat.st_mtime_ns, entry_stat.st_ctime_ns)
 
 
 def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event, max_size: int = MAX_OUTPUT_SIZE) -> bytes:
@@ -183,7 +150,7 @@ async def _remove_container(container_name: str) -> bool:
 
 
 class ExecutionEnvironment:
-    __slots__ = ("session", "language", "code", "container_name", "input_files_hashes")
+    __slots__ = ("session", "language", "code", "container_name", "input_files")
 
     def __init__(self, session: Session, langage: str, code):
         if langage not in COMMANDS:
@@ -194,22 +161,10 @@ class ExecutionEnvironment:
 
         self.container_name = f"ce_{secrets.token_urlsafe(16)}"
 
-        self.input_files_hashes: dict[str, tuple[int, bytes]] = {}
-
-        for directory, directories, files in _walk_session(session.work_directory):
-            try:
-                _chmod_directory(directory)
-            except OSError:
-                directories.clear()
-                continue
-            for file in files:
-                full_path = os.path.join(directory, file)
-                try:
-                    file_size, file_hash = _hash_file(full_path, 0o666)
-                except OSError:
-                    continue
-                sub_path = full_path[len(session.work_directory) + 1:]
-                self.input_files_hashes[sub_path] = (file_size, file_hash)
+        self.input_files: dict[str, tuple[int, int, int, int]] = {
+            sub_path: _signature(entry_stat)
+            for sub_path, entry_stat in _iter_session_files(session.work_directory)
+        }
 
     async def run_container(self) -> ExecutionResult:
         return_code = -1
@@ -235,6 +190,13 @@ class ExecutionEnvironment:
                 "--ulimit", f"nofile={CONTAINER_ULIMIT_NOFILE}:{CONTAINER_ULIMIT_NOFILE}",
                 "--ulimit", f"fsize={CONTAINER_ULIMIT_FSIZE}:{CONTAINER_ULIMIT_FSIZE}",
                 "--cgroupns=private",
+                # Map the container's `appuser` onto the host service account, so session files
+                # have a single owner on both sides of the bind mount. Without it the two uids
+                # differ under rootless Podman and neither side can fully manage the other's
+                # files. The explicit uid/gid is required: a bare `keep-id` maps the host user to
+                # the *same* id in the container, which only lines up if the service account
+                # happens to share CONTAINER_USER_ID.
+                f"--userns=keep-id:uid={CONTAINER_USER_ID},gid={CONTAINER_USER_ID}",
                 "--ipc=none",
                 "--net=bridge",
                 "--tmpfs", f"/tmp:rw,nosuid,nodev,exec,size={CONTAINER_TMPFS_SIZE}",
@@ -280,42 +242,34 @@ class ExecutionEnvironment:
             return_code=return_code, execution_time=execution_time, timed_out=timed_out,
         )
 
-    def get_attachments(self) -> tuple[list[ResultAttachment], list[str]]:
-        attachments = []
-        seen_sub_paths = set()
+    def collect_changes(self) -> tuple[list[str], list[str]]:
+        """Return `(changed_files, deleted_files)` for the finished run, both complete.
+
+        The whole session is walked - it is bounded by the session's inode quota - and every
+        difference is reported. Deciding how many of these fit in a response is the caller's
+        job, since the caller is what opens and serialises them.
+
+        Both lists are sorted, so a caller that has to truncate cuts deterministically.
+        """
+        changed_files = []
         files_size: dict[str, int] = {}
-        for directory, directories, files in _walk_session(self.session.work_directory):
-            for file in files:
-                full_path = os.path.join(directory, file)
-
-                try:
-                    with _open_regular_file(full_path) as (f, file_size):
-                        sub_path = self.session.get_sub_path(full_path)
-                        files_size[sub_path] = file_size
-                        seen_sub_paths.add(sub_path)
-
-                        previous = self.input_files_hashes.get(sub_path)
-                        unchanged = (
-                                previous is not None and
-                                previous[0] == file_size and
-                                previous[1] == _hash(f)
-                        )
-                except OSError:
-                    continue
-
-                if unchanged:
-                    continue  # Skip input attachments that match the original content
-
-                attachments.append(ResultAttachment(sub_path=sub_path, absolute_path=full_path))
+        for sub_path, entry_stat in _iter_session_files(self.session.work_directory):
+            files_size[sub_path] = entry_stat.st_size
+            if self.input_files.get(sub_path) != _signature(entry_stat):
+                changed_files.append(sub_path)
 
         self.session.files_size = files_size
 
-        deleted_files = list(self.input_files_hashes.keys() - seen_sub_paths)
-        return attachments, deleted_files
+        changed_files.sort()
+        return changed_files, sorted(self.input_files.keys() - files_size.keys())
 
 
 async def run_code_async(session: Session, language: str, code: str) -> CodeExecutionResult:
     environment: ExecutionEnvironment = await asyncio.to_thread(ExecutionEnvironment, session, language, code)
     execution_result = await environment.run_container()
-    result_attachments, deleted_files = await asyncio.to_thread(environment.get_attachments)
-    return CodeExecutionResult(execution_result=execution_result, attachments=result_attachments, deleted_files=deleted_files)
+    changed_files, deleted_files = await asyncio.to_thread(environment.collect_changes)
+    return CodeExecutionResult(
+        execution_result=execution_result,
+        changed_files=changed_files,
+        deleted_files=deleted_files,
+    )

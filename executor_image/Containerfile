@@ -48,7 +48,12 @@ ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 \
 COPY executors/* /executors/
 RUN chmod +x /executors/*.sh
 
-RUN useradd appuser -ms /sbin/nologin -d /app
+# The id is pinned because `podman run --userns=keep-id:uid=...,gid=...` maps the host service
+# account onto it (see CONTAINER_USER_ID in code_executor_api/config.py); an unpinned `useradd`
+# would take whatever is free. 4000 rather than the default 1000 so that if the user namespace is
+# ever lost, the container's uid does not land on a real host account.
+RUN groupadd -g 4000 appuser && \
+  useradd -u 4000 -g 4000 appuser -ms /sbin/nologin -d /app
 USER appuser
 
 WORKDIR /app

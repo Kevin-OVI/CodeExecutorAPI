@@ -20,10 +20,12 @@ from .config import (
     CONTAINER_ULIMIT_FSIZE,
     MAX_CONCURRENT_EXECUTIONS,
     MAX_SESSIONS,
+    MAX_SESSION_ENTRIES,
     MAX_SESSION_SIZE,
     PODMAN_CHECK_TIMEOUT_SECONDS,
     SESSION_INACTIVITY_TIMEOUT_SECONDS,
     SESSION_LOCK_WAIT_TIMEOUT_SECONDS,
+    SESSION_QUOTA_COMMAND,
     SESSION_QUOTA_MOUNTPOINT,
     SESSION_ROOT_DIRECTORY,
     SESSION_SWEEP_INTERVAL_SECONDS,
@@ -66,8 +68,11 @@ _PROJECT_ID_MAX = 2 ** 31 - 1
 
 async def _run_xfs_quota(*args: str) -> tuple[int, str, str]:
     try:
+        # SESSION_QUOTA_COMMAND is an argv prefix, not a shell string, so a sudo wrapper adds
+        # no quoting or injection surface. It defaults to a bare `xfs_quota`, which is what a
+        # root API - or one relying on file capabilities - needs.
         process = await asyncio.create_subprocess_exec(
-            "xfs_quota", *args,
+            *SESSION_QUOTA_COMMAND, *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -84,33 +89,23 @@ async def _run_xfs_quota(*args: str) -> tuple[int, str, str]:
     return process.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
-async def _apply_quota(work_directory: str, project_id: int) -> None:
-    if SESSION_QUOTA_MOUNTPOINT is None:
-        return
+async def _verify_quota_hard_limit(project_id: int, report_flag: str, limit_name: str) -> None:
+    """Confirm a hard limit really landed for `project_id`.
 
-    # xfs_quota's `b` suffix means 512-byte basic blocks, not bytes, so bhard must be given in
-    # KiB (`k`) instead — rounded up so the enforced limit is never looser than MAX_SESSION_SIZE.
-    bhard_kib = -(-MAX_SESSION_SIZE // 1024)
-
+    `limit`/`project -s` can fail to actually register a hard limit while still exiting 0 and
+    printing only the routine "Setting up project ... Processed N paths ..." success banner
+    (e.g. when project quota accounting isn't enabled on the target filesystem), so the
+    returncode alone isn't enough. `-N` drops the header and `-n` suppresses the /etc/projid
+    name lookup, which is what keeps the `#<id>` match below reliable. The hard limit is
+    field 3 for both the block (`-b`) and inode (`-i`) reports.
+    """
+    assert SESSION_QUOTA_MOUNTPOINT is not None
     returncode, stdout, stderr = await _run_xfs_quota(
-        "-x",
-        "-c", f"project -s -p {work_directory} {project_id}",
-        "-c", f"limit -p bhard={bhard_kib}k {project_id}",
-        SESSION_QUOTA_MOUNTPOINT,
+        "-x", "-c", f"report -p -N -n {report_flag}", SESSION_QUOTA_MOUNTPOINT
     )
     if returncode != 0:
         raise QuotaSetupFailed(
-            f"xfs_quota setup failed for project {project_id}: {(stdout + stderr).strip()}"
-        )
-
-    # `limit`/`project -s` can fail to actually register a hard limit while still exiting 0 and
-    # printing only the routine "Setting up project ... Processed N paths ..." success banner
-    # (e.g. when project quota accounting isn't enabled on the target filesystem), so confirm
-    # the limit really landed rather than trusting the returncode alone.
-    returncode, stdout, stderr = await _run_xfs_quota("-x", "-c", "report -p -N -b", SESSION_QUOTA_MOUNTPOINT)
-    if returncode != 0:
-        raise QuotaSetupFailed(
-            f"xfs_quota verification failed for project {project_id}: {(stdout + stderr).strip()}"
+            f"xfs_quota {limit_name} verification failed for project {project_id}: {(stdout + stderr).strip()}"
         )
 
     for line in stdout.splitlines():
@@ -118,11 +113,47 @@ async def _apply_quota(work_directory: str, project_id: int) -> None:
         if fields and fields[0] == f"#{project_id}":
             if len(fields) < 4 or not fields[3].isdigit() or int(fields[3]) <= 0:
                 raise QuotaSetupFailed(
-                    f"xfs_quota reports no hard limit set for project {project_id}: {line.strip()}"
+                    f"xfs_quota reports no {limit_name} hard limit set for project {project_id}: {line.strip()}"
                 )
             return
 
-    raise QuotaSetupFailed(f"xfs_quota project {project_id} not found in report after setup")
+    raise QuotaSetupFailed(f"xfs_quota project {project_id} not found in {limit_name} report after setup")
+
+
+async def _apply_quota(work_directory: str, project_id: int) -> None:
+    if SESSION_QUOTA_MOUNTPOINT is None:
+        return
+
+    # xfs_quota's `b` suffix means 512-byte basic blocks, not bytes, so bhard must be given in
+    # KiB (`k`) instead — rounded up so the enforced limit is never looser than MAX_SESSION_SIZE.
+    # ihard takes no unit suffix at all: it is a raw inode count.
+    bhard_kib = -(-MAX_SESSION_SIZE // 1024)
+
+    # Both limits in a single `limit` command: that is one quotactl with a combined mask, so the
+    # project can't end up with only one of the two applied.
+    returncode, stdout, stderr = await _run_xfs_quota(
+        "-x",
+        "-c", f"project -s -p {work_directory} {project_id}",
+        "-c", f"limit -p bhard={bhard_kib}k ihard={MAX_SESSION_ENTRIES} {project_id}",
+        SESSION_QUOTA_MOUNTPOINT,
+    )
+    if returncode != 0:
+        raise QuotaSetupFailed(
+            f"xfs_quota setup failed for project {project_id}: {(stdout + stderr).strip()}"
+        )
+
+    await _verify_quota_hard_limit(project_id, "-b", "block")
+    await _verify_quota_hard_limit(project_id, "-i", "inode")
+
+
+def _entry_type(st_mode: int) -> str:
+    if stat.S_ISREG(st_mode):
+        return "file"
+    if stat.S_ISDIR(st_mode):
+        return "directory"
+    if stat.S_ISLNK(st_mode):
+        return "symlink"
+    return "other"
 
 
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
@@ -194,12 +225,55 @@ class Session:
                     raise FileNotFoundError(normalised_sub_path) from None
                 raise
             try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                file_mode = os.fstat(fd).st_mode
+                if stat.S_ISDIR(file_mode):
+                    # Distinct from "not found" so the files API can serve a listing instead.
+                    raise IsADirectoryError(normalised_sub_path)
+                if not stat.S_ISREG(file_mode):
                     raise FileNotFoundError(normalised_sub_path)
                 return read_file(fd, filename=normalised_sub_path, field_name=field_name)
             except BaseException:
                 os.close(fd)
                 raise
+
+    def list_directory(self, sub_path: str) -> dict[str, Any]:
+        """List one directory level, without following symlinks anywhere along the path.
+
+        Unlike execution results this hides nothing: hidden directories and symlinks are
+        reported too, so a caller can always discover what a session actually holds.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        normalised_sub_path = "" if sub_path.strip("/") == "" else normalize_sub_path(sub_path)
+
+        if not normalised_sub_path:
+            fd = os.open(self.work_directory, flags)
+        else:
+            with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
+                try:
+                    fd = os.open(filename, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise NotADirectoryError(normalised_sub_path) from None
+                    raise
+
+        try:
+            entries = []
+            for name in os.listdir(fd):
+                try:
+                    entry_stat = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": name,
+                    "type": _entry_type(entry_stat.st_mode),
+                    "size": entry_stat.st_size,
+                    "modified_at": entry_stat.st_mtime,
+                })
+        finally:
+            os.close(fd)
+
+        entries.sort(key=lambda entry: entry["name"])
+        return {"path": normalised_sub_path, "entries": entries}
 
     async def stage_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter) -> tuple[str, str]:
         """Write `content` to a hidden temp file inside sub_path's parent directory, without
@@ -215,8 +289,8 @@ class Session:
             # OS-enforced XFS quota below is what actually rejected the write.
             raise SessionResourceLimitReached("Session storage limit reached") from None
         except OSError as exc:
-            if exc.errno == errno.ENOSPC:
-                raise SessionResourceLimitReached("Session storage limit reached") from None
+            if exc.errno == errno.ENOSPC or exc.errno == errno.EDQUOT:
+                raise SessionResourceLimitReached("Session storage or file count limit reached") from None
             raise
         return normalised_sub_path, temporary_name
 
@@ -238,8 +312,8 @@ class Session:
         except OSError as exc:
             with contextlib.suppress(OSError):
                 await self.discard_staged_file(normalised_sub_path, temporary_name)
-            if exc.errno == errno.ENOSPC:
-                raise SessionResourceLimitReached("Session storage limit reached") from None
+            if exc.errno == errno.ENOSPC or exc.errno == errno.EDQUOT:
+                raise SessionResourceLimitReached("Session storage or file count limit reached") from None
             raise
 
     def delete_file(self, sub_path: str):

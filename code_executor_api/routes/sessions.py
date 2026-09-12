@@ -1,5 +1,4 @@
 import logging
-import os
 
 from aiohttp import web
 
@@ -16,12 +15,6 @@ from ..sessions import (
 
 __all__ = ("handle_create_session", "handle_delete_session")
 LOGGER = logging.getLogger(__name__)
-
-
-def _write_file_sync(full_path: str, content: bytes) -> None:
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, "wb") as f:
-        f.write(content)
 
 
 async def handle_create_session(request: web.Request) -> web.Response:

@@ -1,9 +1,19 @@
 import argparse
 import asyncio
 import json
+import re
 
 import aiohttp
 from yarl import URL
+
+# Code runs attached to a PTY, so runtimes treat stdout as a terminal and may colourise it
+# (Node renders booleans in yellow, for instance). That is intended - the sandbox ships
+# lolcat and cmatrix - so assertions on output have to look past the escape sequences.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
 
 
 async def _execute(
@@ -37,8 +47,10 @@ async def _execute(
             if part.headers.get(aiohttp.hdrs.CONTENT_TYPE) == "application/json":
                 result = json.loads(await part.read(decode=False))
             else:
-                filename = part.filename
-                files[filename] = await part.read(decode=False)
+                # part.filename resolves the RFC 5987 `filename*` parameter, so a nested
+                # attachment arrives as its real sub_path ("out/file.txt") with no decoding
+                # needed here.
+                files[part.filename] = await part.read(decode=False)
         result["files"] = files
         return result
 
@@ -205,7 +217,7 @@ async def check_javascript_module_styles(session: aiohttp.ClientSession, api_url
     }
     for style, code in snippets.items():
         result = await _execute(session, api_url, "javascript", code, session_id=session_id)
-        assert result["return_code"] == 0 and "ok" in result["output"], f"javascript {style} failed: {result}"
+        assert result["return_code"] == 0 and "ok" in _plain(result["output"]), f"javascript {style} failed: {result}"
         print(f"Execute javascript ({style}) -> {result['output']!r}")
 
     result = await _execute(
@@ -229,7 +241,7 @@ async def check_typescript(session: aiohttp.ClientSession, api_url: str, session
     }
     for style, code in snippets.items():
         result = await _execute(session, api_url, "typescript", code, session_id=session_id)
-        assert result["return_code"] == 0 and "ok true" in result["output"], f"typescript {style} failed: {result}"
+        assert result["return_code"] == 0 and "ok true" in _plain(result["output"]), f"typescript {style} failed: {result}"
         assert not result["files"], f"typescript {style} left files behind in the session: {sorted(result['files'])}"
         print(f"Execute typescript ({style}) -> {result['output']!r}")
 
@@ -242,6 +254,181 @@ async def check_typescript(session: aiohttp.ClientSession, api_url: str, session
         f"typescript could not import a session module through a relative specifier: {result}"
     )
     print(f"Execute typescript (relative import from the session dir) -> {result['output']!r}")
+
+
+async def _new_session(session: aiohttp.ClientSession, api_url: str) -> str:
+    async with session.post(f"{api_url}/sessions") as response:
+        assert response.status == 200, f"POST /sessions failed: {response.status}"
+        return (await response.json())["session_id"]
+
+
+async def check_directory_listing(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
+    async with session.get(f"{api_url}/sessions/{session_id}/files/") as response:
+        assert response.status == 200, f"Expected 200 listing the session root, got {response.status}"
+        listing = await response.json()
+    names = {entry["name"]: entry for entry in listing["entries"]}
+    print(f"Root listing: {sorted(names)}")
+
+    assert listing["path"] == "", f"Expected an empty path for the root listing, got {listing['path']!r}"
+    assert "hello.txt" in names, f"Root listing is missing a known file: {sorted(names)}"
+    assert names["hello.txt"]["type"] == "file", f"hello.txt typed as {names['hello.txt']['type']!r}"
+    assert names["hello.txt"]["size"] > 0, "hello.txt reported as empty"
+    assert names["leak"]["type"] == "symlink", (
+        f"A symlink must be reported as such and never followed, got {names['leak']['type']!r}"
+    )
+
+    # Unlike execution results, a listing hides nothing -- it is how a caller discovers files
+    # that /execute excluded or omitted.
+    await _execute(session, api_url, "bash", "mkdir -p listdir/.hidden && echo x > listdir/.hidden/secret.txt && echo y > listdir/plain.txt", session_id=session_id)
+    async with session.get(f"{api_url}/sessions/{session_id}/files/listdir") as response:
+        assert response.status == 200, f"Expected 200 listing a subdirectory, got {response.status}"
+        nested = await response.json()
+    nested_names = {entry["name"]: entry for entry in nested["entries"]}
+    assert nested["path"] == "listdir", f"Unexpected listing path: {nested['path']!r}"
+    assert sorted(nested_names) == [".hidden", "plain.txt"], f"Unexpected listing: {sorted(nested_names)}"
+    assert nested_names[".hidden"]["type"] == "directory", "A hidden directory must still be listed"
+    print(f"Subdirectory listing: {sorted(nested_names)} (hidden entries included)")
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/listdir/plain.txt") as response:
+        assert response.status == 200, f"Expected 200 reading a file, got {response.status}"
+        assert (await response.read()) == b"y\n", "A file GET must still return raw bytes, not a listing"
+    print("GET on a file still returns bytes (as expected)")
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/escapedir") as response:
+        assert response.status == 404, (
+            f"Expected 404 listing through a symlinked directory, got {response.status}"
+        )
+    print("GET listing on a symlinked directory -> 404 (as expected, not followed)")
+
+
+async def check_result_attachment_cap(session: aiohttp.ClientSession, api_url: str, max_result_attachments: int) -> None:
+    session_id = await _new_session(session, api_url)
+    try:
+        total = max_result_attachments + 50
+        result = await _execute(
+            session, api_url, "bash",
+            f"for i in $(seq 1 {total}); do printf 'content %s' \"$i\" > \"out_$i.txt\"; done",
+            session_id=session_id,
+        )
+        omitted = result["omitted_files"]
+        print(f"Created {total} files -> {len(result['files'])} attachments, {len(omitted)} omitted")
+
+        assert result["return_code"] == 0, f"Creating {total} files failed: {result['output']!r}"
+        assert len(result["files"]) == max_result_attachments, (
+            f"Expected exactly {max_result_attachments} attachments, got {len(result['files'])}"
+        )
+        assert len(omitted) == total - max_result_attachments, (
+            f"Expected {total - max_result_attachments} omitted files, got {len(omitted)}"
+        )
+        assert not (set(result["files"]) & set(omitted)), "A file was both attached and omitted"
+        assert len(set(result["files"]) | set(omitted)) == total, "Some changed files were reported nowhere"
+
+        # An omitted file is not a lost file: it must still be retrievable individually.
+        probe = omitted[0]
+        async with session.get(f"{api_url}/sessions/{session_id}/files/{probe}") as response:
+            assert response.status == 200, f"Expected 200 fetching omitted file {probe}, got {response.status}"
+            assert (await response.read()).startswith(b"content "), f"Unexpected content for {probe}"
+        print(f"Omitted file {probe} still retrievable via the files API (as expected)")
+
+        # A session over the attachment cap must stay usable, not become permanently broken.
+        result = await _execute(session, api_url, "bash", "echo still-alive", session_id=session_id)
+        assert result["return_code"] == 0, f"Follow-up execute on a large session failed: {result}"
+        assert not result["files"] and not result["omitted_files"], (
+            f"A no-op run reported changes: {sorted(result['files'])} / {result['omitted_files']}"
+        )
+        print("Follow-up execute on the same over-cap session -> ok, nothing reported as changed")
+    finally:
+        await session.delete(f"{api_url}/sessions/{session_id}")
+
+
+async def check_change_detection_stability(session: aiohttp.ClientSession, api_url: str) -> None:
+    session_id = await _new_session(session, api_url)
+    try:
+        async with session.put(f"{api_url}/sessions/{session_id}/files/uploaded.txt", data=b"uploaded") as response:
+            assert response.status == 204, f"PUT failed: {response.status}"
+
+        result = await _execute(
+            session, api_url, "bash",
+            "mkdir -p made/deeper && echo created > made/deeper/by_container.txt",
+            session_id=session_id,
+        )
+        assert "made/deeper/by_container.txt" in result["files"], (
+            f"A container-created file was not returned: {sorted(result['files'])}"
+        )
+        assert "uploaded.txt" not in result["files"], "An untouched upload was reported as changed"
+
+        # Both the API-created and the container-created file must now be treated as unchanged.
+        # Before identity mapping the container-created one was re-sent on every single run.
+        for attempt in (1, 2):
+            result = await _execute(session, api_url, "bash", "true", session_id=session_id)
+            assert not result["files"], (
+                f"No-op run {attempt} re-reported unchanged files: {sorted(result['files'])}"
+            )
+            assert not result["deleted_files"], f"No-op run {attempt} reported deletions: {result['deleted_files']}"
+        print("Repeated no-op runs report no changes for API- and container-created files (as expected)")
+
+        # Rewriting with different content must still be caught, in both locations.
+        result = await _execute(
+            session, api_url, "bash",
+            "echo rewritten > made/deeper/by_container.txt && echo rewritten > uploaded.txt",
+            session_id=session_id,
+        )
+        assert set(result["files"]) == {"made/deeper/by_container.txt", "uploaded.txt"}, (
+            f"Rewrites were not detected: {sorted(result['files'])}"
+        )
+        print("Rewrites detected for both file origins (as expected)")
+
+        result = await _execute(session, api_url, "bash", "rm uploaded.txt", session_id=session_id)
+        assert result["deleted_files"] == ["uploaded.txt"], f"Deletion not detected: {result['deleted_files']}"
+        print("Deletion still detected (as expected)")
+    finally:
+        await session.delete(f"{api_url}/sessions/{session_id}")
+
+
+async def check_home_directory_noise_excluded(session: aiohttp.ClientSession, api_url: str) -> None:
+    session_id = await _new_session(session, api_url)
+    try:
+        # The session directory is the container's $HOME, so tool caches land in it. They must not
+        # drown the real results, but must remain visible through the files API.
+        result = await _execute(
+            session, api_url, "bash",
+            "mkdir -p .cache/pip .local/lib && echo junk > .cache/pip/blob && echo junk > .local/lib/mod.py && echo real > result.txt",
+            session_id=session_id,
+        )
+        assert sorted(result["files"]) == ["result.txt"], (
+            f"Hidden directories leaked into the attachments: {sorted(result['files'])}"
+        )
+        print(f"Hidden $HOME directories excluded from attachments (got {sorted(result['files'])})")
+
+        async with session.get(f"{api_url}/sessions/{session_id}/files/.cache/pip") as response:
+            assert response.status == 200, f"Excluded files must stay listable, got {response.status}"
+            names = [entry["name"] for entry in (await response.json())["entries"]]
+        assert names == ["blob"], f"Unexpected listing of an excluded directory: {names}"
+        print("Excluded directories are still reachable through the files API (as expected)")
+    finally:
+        await session.delete(f"{api_url}/sessions/{session_id}")
+
+
+async def check_inode_quota_enforcement(session: aiohttp.ClientSession, api_url: str, max_session_entries: int) -> None:
+    session_id = await _new_session(session, api_url)
+    try:
+        probe = max_session_entries + 256
+        result = await _execute(
+            session, api_url, "bash",
+            f"mkdir -p flood && cd flood && for i in $(seq 1 {probe}); do : > \"f_$i\" || exit 1; done",
+            session_id=session_id,
+        )
+        print(f"Inode quota probe ({probe} empty files): return_code={result['return_code']} output={result['output']!r}")
+        assert result["return_code"] != 0, (
+            f"Creating {probe} files past --max-session-entries succeeded -- the session directory "
+            "does not appear to be under an XFS project inode quota (check SESSION_QUOTA_MOUNTPOINT, "
+            "that the filesystem is mounted prjquota rather than pqnoenforce, and that ihard was applied)"
+        )
+        assert "no space" in result["output"].lower(), (
+            f"Expected an ENOSPC error (XFS reports project quotas as ENOSPC, not EDQUOT): {result['output']!r}"
+        )
+    finally:
+        await session.delete(f"{api_url}/sessions/{session_id}")
 
 
 async def check_error_cases(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
@@ -262,14 +449,15 @@ async def check_error_cases(session: aiohttp.ClientSession, api_url: str, sessio
     print("GET path escaping session root -> 400 (as expected)")
 
 
-async def run(api_url: str, *, check_quota: bool, max_session_size: int) -> None:
+async def run(
+        api_url: str, *, check_quota: bool, max_session_size: int,
+        max_session_entries: int, max_result_attachments: int,
+) -> None:
     async with aiohttp.ClientSession() as session:
         await check_health(session, api_url)
         await check_seeded_session(session, api_url)
 
-        async with session.post(f"{api_url}/sessions") as response:
-            data = await response.json()
-            session_id = data["session_id"]
+        session_id = await _new_session(session, api_url)
         print(f"Created session: {session_id}")
 
         await check_file_lifecycle(session, api_url, session_id)
@@ -278,13 +466,19 @@ async def run(api_url: str, *, check_quota: bool, max_session_size: int) -> None
         await check_symlink_attachment_excluded(session, api_url, session_id)
         await check_symlink_directory_escape_blocked(session, api_url, session_id)
         await check_readonly_root_filesystem(session, api_url, session_id)
+        await check_directory_listing(session, api_url, session_id)
         if check_quota:
             await check_disk_quota_enforcement(session, api_url, session_id, max_session_size)
+            await check_inode_quota_enforcement(session, api_url, max_session_entries)
         else:
-            print("Skipping disk quota check (pass --check-quota once SESSION_QUOTA_MOUNTPOINT is configured)")
+            print("Skipping disk/inode quota checks (pass --check-quota once SESSION_QUOTA_MOUNTPOINT is configured)")
         await check_rejected_execute_leaves_no_attachment(session, api_url, session_id)
         await check_javascript_module_styles(session, api_url, session_id)
         await check_typescript(session, api_url, session_id)
+        # These run on their own sessions: they create enough files to disturb the shared one.
+        await check_change_detection_stability(session, api_url)
+        await check_home_directory_noise_excluded(session, api_url)
+        await check_result_attachment_cap(session, api_url, max_result_attachments)
         await check_ephemeral_execute(session, api_url)
         await check_error_cases(session, api_url, session_id)
 
@@ -304,12 +498,26 @@ if __name__ == "__main__":
     parser.add_argument("--api-url", default="http://127.0.0.1:40003", help="Base URL for the API server")
     parser.add_argument(
         "--check-quota", action="store_true",
-        help="Also verify MAX_SESSION_SIZE is enforced from inside the container (requires the server's "
-             "SESSION_QUOTA_MOUNTPOINT to be configured with a working XFS project quota setup)",
+        help="Also verify MAX_SESSION_SIZE and MAX_SESSION_ENTRIES are enforced from inside the container "
+             "(requires the server's SESSION_QUOTA_MOUNTPOINT to be configured with a working XFS project quota setup)",
     )
     parser.add_argument(
         "--max-session-size", type=int, default=104_857_600,
         help="The server's configured MAX_SESSION_SIZE in bytes, used to size the --check-quota probe write (default: 100 MiB)",
     )
+    parser.add_argument(
+        "--max-session-entries", type=int, default=32768,
+        help="The server's configured MAX_SESSION_ENTRIES, used to size the --check-quota inode probe (default: 32768)",
+    )
+    parser.add_argument(
+        "--max-result-attachments", type=int, default=256,
+        help="The server's configured MAX_RESULT_ATTACHMENTS, used by the partial-result check (default: 256)",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.api_url, check_quota=args.check_quota, max_session_size=args.max_session_size))
+    asyncio.run(run(
+        args.api_url,
+        check_quota=args.check_quota,
+        max_session_size=args.max_session_size,
+        max_session_entries=args.max_session_entries,
+        max_result_attachments=args.max_result_attachments,
+    ))
