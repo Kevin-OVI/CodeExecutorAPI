@@ -205,7 +205,6 @@ curl -X DELETE http://127.0.0.1:40003/sessions/{session_id}/files/some/path.txt
 
 - `GET`/`PUT`/`DELETE` on a file return `404` if the session or file doesn't exist.
 - `PUT` creates or overwrites the file (parent directories are created as needed); the request body is the raw file bytes.
-- Paths use Linux separators: `/` separates directories, while `\` is a literal character in a filename, not an alias for `/`.
 - `GET` on a **directory** returns a JSON listing of that one level instead of file bytes; an empty path lists the session root. Unlike execution results the listing hides nothing - hidden directories and symlinks are included - so it is the way to discover files that `/execute` excluded or omitted. Symlinks are reported, never followed.
 
 ```json
