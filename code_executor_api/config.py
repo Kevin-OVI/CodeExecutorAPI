@@ -30,6 +30,17 @@ def _read_optional_str_env(name: str) -> str | None:
     return value
 
 
+def _read_optional_path_env(name: str) -> str | None:
+    """Read an optional path and anchor it, so it survives being handed to a child process.
+
+    A relative setting is resolved against the API's own working directory at import time,
+    which is what it already meant implicitly - but session paths are passed to `podman`,
+    which runs with its own working directory, and a relative one would resolve elsewhere.
+    """
+    value = _read_optional_str_env(name)
+    return value if value is None else os.path.abspath(value)
+
+
 def _read_int_env(name: str, default: int, *, min_value: int | None = None) -> int:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -72,6 +83,6 @@ PODMAN_CHECK_TIMEOUT_SECONDS = _read_int_env("PODMAN_CHECK_TIMEOUT_SECONDS", 5, 
 SESSION_INACTIVITY_TIMEOUT_SECONDS = _read_int_env("SESSION_INACTIVITY_TIMEOUT_SECONDS", 1800, min_value=1)
 SESSION_SWEEP_INTERVAL_SECONDS = _read_int_env("SESSION_SWEEP_INTERVAL_SECONDS", 60, min_value=1)
 SESSION_LOCK_WAIT_TIMEOUT_SECONDS = _read_int_env("SESSION_LOCK_WAIT_TIMEOUT_SECONDS", 30, min_value=1)
-SESSION_ROOT_DIRECTORY = _read_optional_str_env("SESSION_ROOT_DIRECTORY")
+SESSION_ROOT_DIRECTORY = _read_optional_path_env("SESSION_ROOT_DIRECTORY")  # absolute: session directories are bind-mounted by podman, which does not share this process's working directory
 SESSION_QUOTA_MOUNTPOINT = _read_optional_str_env("SESSION_QUOTA_MOUNTPOINT")  # XFS mountpoint (containing SESSION_ROOT_DIRECTORY) to enforce MAX_SESSION_SIZE via a per-session XFS project quota; unset disables quota enforcement
 SESSION_QUOTA_COMMAND = _read_argv_env("SESSION_QUOTA_COMMAND", "xfs_quota")  # argv prefix used to run xfs_quota; set to e.g. "sudo -n /usr/sbin/xfs_quota" when the API runs unprivileged and CAP_SYS_ADMIN is delegated through a scoped sudoers rule

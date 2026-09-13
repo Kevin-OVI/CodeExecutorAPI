@@ -213,6 +213,15 @@ class ExecutionEnvironment:
                 "nice", "-n", str(current_niceness + CONTAINER_RELATIVE_NICENESS),
                 *command, self.code,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                # conmon records a cgroup OOM kill by creating an empty marker file named `oom`
+                # in its working directory, which it inherits from podman, which inherits it from
+                # this process - so a run that exhausts MAX_MEMORY would otherwise litter whatever
+                # directory the API was started from. Rooting podman at `/` sends the marker
+                # somewhere unwritable, where conmon quietly gives up on it. Nothing here reads it:
+                # an OOM kill is already visible as the container's non-zero return code, and the
+                # only consumer of the marker is `podman inspect`'s OOMKilled field, which this
+                # `--rm` run never queries. Every path passed above must therefore be absolute.
+                cwd="/",
             )
             try:
                 return_code = await asyncio.wait_for(process.wait(), timeout=EXECUTION_TIMEOUT)
