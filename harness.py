@@ -1515,6 +1515,84 @@ async def check_outbound_network(session: aiohttp.ClientSession, api_url: str, c
     print("Outbound DNS and TCP both work from inside the sandbox (as expected)")
 
 
+async def check_ping_without_net_raw(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
+    """`ping` works, and the capability sets are still empty.
+
+    Both halves matter, and only together. `ping` is the one shipped utility --cap-drop=ALL
+    appears to break, and its own error message ("missing cap_net_raw+p capability") points at
+    the wrong fix: the real cause is podman's default net.ipv4.ping_group_range of `0 0` refusing
+    the ICMP datagram socket to a container that runs as CONTAINER_USER_ID, which sends iputils
+    down its raw-socket fallback. The --sysctl in podman_executor.py widens the range to that one
+    gid and nothing else changes.
+
+    Asserting the capability sets alongside it is what stops the obvious wrong fix from passing
+    this check. --cap-add=NET_RAW would also make ping work, but podman adds capabilities as
+    *ambient* ones, so it is not /bin/ping that gets CAP_NET_RAW - it is every process the
+    executed code spawns, which then has AF_PACKET sockets and can sniff, ARP-poison and spoof
+    source addresses on the bridge shared with every concurrently running session.
+
+    The probe pings loopback rather than a public address: the socket call is the gate being
+    tested, and ICMP egress is neither required for that nor guaranteed on every network.
+    outbound_network is the check that covers reaching the outside world.
+    """
+    result = await _execute(
+        session, api_url, "python",
+        "import json, re, socket, subprocess\n"
+        "report = {}\n"
+        "status = open('/proc/self/status').read()\n"
+        "report['caps'] = {n: v for n, v in re.findall(r'^Cap(\\w+):\\s+([0-9a-f]+)$', status, re.M)}\n"
+        "report['ping_group_range'] = open('/proc/sys/net/ipv4/ping_group_range').read().split()\n"
+        "report['gid'] = socket.os.getgid()\n"
+        "try:\n"
+        "    socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP).close()\n"
+        "    report['icmp_dgram_socket'] = 'ok'\n"
+        "except OSError as exc:\n"
+        "    report['icmp_dgram_socket'] = type(exc).__name__ + ': ' + str(exc)\n"
+        "try:\n"
+        "    socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 3).close()\n"
+        "    report['af_packet_socket'] = 'OPENED'\n"
+        "except OSError as exc:\n"
+        "    report['af_packet_socket'] = type(exc).__name__\n"
+        "proc = subprocess.run(['ping', '-c', '1', '-W', '2', '127.0.0.1'],\n"
+        "                      capture_output=True, text=True, timeout=10)\n"
+        "report['ping_rc'] = proc.returncode\n"
+        "report['ping_output'] = (proc.stdout + proc.stderr).strip()[-300:]\n"
+        "print(json.dumps(report))",
+        session_id=session_id,
+    )
+    output = _plain(result["output"]).strip()
+    assert result["return_code"] == 0, f"The ping probe itself failed to run: {output[-300:]!r}"
+    report = json.loads(output.split("\n")[-1])
+    print(f"ping probe: gid={report['gid']} ping_group_range={report['ping_group_range']} "
+          f"icmp_dgram_socket={report['icmp_dgram_socket']!r} af_packet_socket={report['af_packet_socket']!r} "
+          f"ping_rc={report['ping_rc']} caps={report['caps']}")
+
+    granted = {name: value for name, value in report["caps"].items() if value.strip("0") != ""}
+    assert not granted, (
+        f"The container holds capabilities {granted} -- --cap-drop=ALL is no longer in effect. "
+        "If this came from adding --cap-add=NET_RAW to make ping work, revert it: podman grants "
+        "capabilities ambiently, so every process the executed code spawns would hold CAP_NET_RAW "
+        "and with it AF_PACKET sockets, i.e. packet capture, ARP poisoning and source-address "
+        "spoofing against the other sessions sharing CONTAINER_NETWORK. The supported fix is the "
+        "--sysctl net.ipv4.ping_group_range in podman_executor.py, which needs no capability."
+    )
+    assert report["af_packet_socket"] != "OPENED", (
+        "Executed code opened an AF_PACKET socket, so it has layer-2 access to the bridge it "
+        "shares with every concurrently running session"
+    )
+    assert report["icmp_dgram_socket"] == "ok", (
+        "Executed code cannot open an ICMP datagram socket "
+        f"({report['icmp_dgram_socket']}), so ping falls back to a raw socket and fails. "
+        f"gid {report['gid']} is outside ping_group_range {report['ping_group_range']} -- check "
+        "that the --sysctl in podman_executor.py is present and derived from CONTAINER_USER_ID, "
+        "and note that podman rejects that flag entirely when CONTAINER_NETWORK=host."
+    )
+    assert report["ping_rc"] == 0, (
+        f"The ICMP datagram socket works but ping still failed: {report['ping_output']!r}"
+    )
+    print("ping works with every capability still dropped (as expected)")
+
+
 async def check_api_unreachable_from_sandbox(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
     """Executed code cannot reach the API that is running it.
 
@@ -2026,6 +2104,8 @@ CHECKS: tuple[Check, ...] = (
           summary="the sandbox has outbound DNS and TCP, as --net=bridge intends"),
     Check("api_unreachable_from_sandbox", check_api_unreachable_from_sandbox, group="network",
           summary="executed code cannot reach the API that is running it"),
+    Check("ping_without_net_raw", check_ping_without_net_raw, group="network",
+          summary="ping works with every capability still dropped"),
     Check("directory_listing", check_directory_listing,
           summary="GET on a directory lists one level and hides nothing"),
     Check("disk_quota_enforcement", check_disk_quota_enforcement, group="quota", heavy=True, timeout=300.0,

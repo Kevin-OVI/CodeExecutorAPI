@@ -200,6 +200,7 @@ class ExecutionEnvironment:
                 f"--userns=keep-id:uid={CONTAINER_USER_ID},gid={CONTAINER_USER_ID}",
                 "--ipc=none",
                 f"--net={CONTAINER_NETWORK}",
+                "--sysctl", f"net.ipv4.ping_group_range={CONTAINER_USER_ID} {CONTAINER_USER_ID}",
                 "--tmpfs", f"/tmp:rw,nosuid,nodev,exec,size={CONTAINER_TMPFS_SIZE}",
                 "--interactive", "--tty", "--rm",
                 "--label", "code_executor_api.managed=true",

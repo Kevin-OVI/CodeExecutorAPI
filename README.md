@@ -84,7 +84,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `CONTAINER_ULIMIT_FSIZE` (default: `268435456` bytes)
 - `CONTAINER_RELATIVE_NICENESS` (default: `5`)
 - `CONTAINER_TMPFS_SIZE` (default: `64m`)
-- `CONTAINER_NETWORK` (default: `bridge`) - the podman network executed code runs on, passed straight to `podman run --net`. The default bridge reaches the host, and therefore whatever the host exposes on it; point this at a dedicated network firewalled off `PORT` to keep outbound access while denying the sandbox a route back to the API. See [Hardening](#hardening)
+- `CONTAINER_NETWORK` (default: `bridge`) - the podman network executed code runs on, passed straight to `podman run --net`. The default bridge reaches the host, and therefore whatever the host exposes on it; point this at a dedicated network firewalled off `PORT` to keep outbound access while denying the sandbox a route back to the API. See [Hardening](#hardening). Must be a network that gets its own namespace: `host` makes `podman run` fail outright, because the container is also given `--sysctl net.ipv4.ping_group_range` (see [`ping` needs no capability](#ping-needs-no-capability))
 - `PODMAN_IMAGE` (default: `code_executor`)
 - `PODMAN_CHECK_TIMEOUT_SECONDS` (default: `5`)
 - `SESSION_INACTIVITY_TIMEOUT_SECONDS` (default: `1800`) - idle sessions are deleted after this long
@@ -147,6 +147,34 @@ Verify both with the harness - `api_unreachable_from_sandbox` probes the host al
 ```bash
 python harness.py --only api_unreachable_from_sandbox outbound_network
 ```
+
+### `ping` needs no capability
+
+Containers run with `--cap-drop=ALL`, and `ping` is the one shipped utility that looks like a casualty of it. Its own error message says so:
+
+```
+ping: socktype: SOCK_RAW
+ping: socket: Operation not permitted
+ping: => missing cap_net_raw+p capability or setuid?
+```
+
+That message points at the wrong fix. iputils' `ping` opens an ICMP *datagram* socket first and only falls back to a raw socket when the kernel refuses it, and what refuses it here is podman's default `net.ipv4.ping_group_range` of `0 0` - root's gid only - meeting a container that runs as `CONTAINER_USER_ID`. Nothing about the capability set is involved. Widening the range to exactly that one gid is therefore the whole fix, and `podman_executor.py` passes it unconditionally:
+
+```
+--sysctl net.ipv4.ping_group_range=4000 4000
+```
+
+`--cap-add=NET_RAW` would also make `ping` work, which is what makes this worth writing down. Podman adds capabilities as **ambient** ones, so the grant is not scoped to `/bin/ping`: every process the executed code spawns holds `CAP_NET_RAW` effective, and with it `AF_PACKET` sockets. That is packet capture, ARP poisoning and source-address spoofing on a bridge shared with up to `MAX_CONCURRENT_EXECUTIONS` other sessions - so it would break the cross-session isolation claimed above, which rests on session ids being unguessable rather than on anything at the network layer. It would also make the nftables rule above (which matches on `ip saddr`) stop being a boundary, since forged frames can carry a source outside the sandbox subnet.
+
+Note that `--security-opt=no-new-privileges` rules out the other obvious route as well: with `NO_NEW_PRIVS` set the kernel ignores file capabilities on `execve`, so `setcap cap_net_raw+ep /bin/ping` in the `Containerfile` would not work either.
+
+The `ping_without_net_raw` check asserts both halves - that `ping` works *and* that every capability set is still empty - because either one alone passes under the wrong fix:
+
+```bash
+python harness.py --only ping_without_net_raw
+```
+
+Utilities that genuinely do stay unavailable under `--cap-drop=ALL`: `nmap`'s privileged scan types (`-sS`, `-sU`, `-O`, `--traceroute`; note that `--cap-add` would not help, as nmap gates those on `geteuid() == 0` rather than on capabilities - `-sT`, its non-root default, works), binding ports below 1024, `chown` to another uid, `mount`, `dmesg`, and raising ulimits. Everything else the image ships - `dig`, `netstat`, `arp`, `telnet`, `git`, `curl`, `wget` and the Python stack - is unaffected.
 
 ### Enforcing `MAX_SESSION_SIZE` with an XFS project quota
 
