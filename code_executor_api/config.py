@@ -1,3 +1,13 @@
+"""Every tunable the API has, read from the environment once at import.
+
+Import time is deliberate: a malformed setting raises here and the process never starts,
+rather than becoming a 500 on whichever request first touches it. Importers bind these as
+plain constants, so changing a setting means restarting the server.
+
+Trailing comments give the unit, and name whatever outside this file a value has to agree
+with - the Containerfile's uid, the kernel's argv limit, the XFS quota.
+"""
+
 import os
 import shlex
 

@@ -8,6 +8,13 @@ SUPPORTED_LANGUAGES = frozenset(("python", "bash", "javascript", "typescript", "
 
 
 class ValidationError(HTTPBadRequest):
+    """A 400 carrying the same `{"error": ...}` body every other response on the API uses.
+
+    Subclassing the aiohttp exception lets validation raise from frames well below a handler
+    and still reach the client as a 400 rather than a 500. A bare `HTTPBadRequest` would do
+    that much but answer in aiohttp's default HTML.
+    """
+
     def __init__(self, message: str, headers=None):
         if headers is None:
             headers = {}

@@ -89,9 +89,9 @@ async def handle_execute(request: web.Request) -> web.Response:
 
                 # Drop each entry as it lands, so the `finally` below discards exactly those
                 # attachments that were never committed. This is not atomic - os.replace has
-                # overwritten the previous content by the time a later one fails - but a
-                # mid-loop failure no longer leaves committed entries queued for a discard that
-                # cannot apply to them.
+                # overwritten the previous content by the time a later one fails - but the
+                # discard list stays accurate either way: a committed entry is never queued for
+                # a discard that would apply to whatever now holds its name.
                 while staged:
                     normalised_sub_path, temporary_name = staged[0]
                     await session.commit_staged_file(normalised_sub_path, temporary_name)

@@ -17,6 +17,12 @@ type SupportedContentType = BodyPartReader | StreamReader | bytes
 
 
 def _prepare_reader(content: SupportedContentType) -> tuple[_Reader, _EOFPredicate]:
+    """Reduce the three shapes a body arrives in to one `(read, at_eof)` pair.
+
+    A multipart part, a raw request stream and an in-memory `bytes` all feed the same
+    size-capped write loop, which would otherwise branch per source in each of its copies.
+    `bytes` has no reader, so it gets one that yields the buffer once and then reports EOF.
+    """
     if isinstance(content, bytes):
         read_file = False
 
@@ -38,7 +44,7 @@ def _prepare_reader(content: SupportedContentType) -> tuple[_Reader, _EOFPredica
     if isinstance(content, StreamReader):
         return content.read, content.at_eof
 
-    raise TypeError(f"Unsupported type for content")
+    raise TypeError(f"Unsupported type for content: {type(content).__name__}")
 
 
 async def _write_content(

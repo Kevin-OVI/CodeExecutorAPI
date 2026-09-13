@@ -179,6 +179,12 @@ def _remove_tree(path: str) -> None:
 
 
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
+    """Take `lock` if it is free right now, otherwise report failure without waiting.
+
+    `asyncio.Lock` has no non-blocking acquire, and `locked()` is not a substitute: it reports
+    a state rather than reserving one, so a queued waiter can be handed the lock in the await
+    that follows the check. The smallest positive timeout does both in one step.
+    """
     try:
         await asyncio.wait_for(lock.acquire(), timeout=sys.float_info.min)
     except TimeoutError:
@@ -196,6 +202,16 @@ class Session:
 
     @contextlib.contextmanager
     def _open_parent(self, normalised_sub_path: str, create_dir: bool):
+        """Open the directory holding `normalised_sub_path`, yielding `(fd, final_name, path)`.
+
+        This is what keeps file operations inside the session. Executed code owns the tree and
+        can swap any component for a symlink between a check and the syscall, so the walk
+        descends one component at a time with `O_NOFOLLOW` and callers act relative to the fd
+        yielded here, never on a reassembled path.
+
+        A symlinked or non-directory component (ELOOP, ENOTDIR) is reported as a plain
+        `FileNotFoundError`: an escape attempt need not be distinguishable from a typo.
+        """
         path_parts = normalised_sub_path.split("/")
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         parent_fd = os.open(self.work_directory, flags)
@@ -323,9 +339,9 @@ class Session:
             await self.commit_staged_file(normalised_sub_path, temporary_name)
         except BaseException as exc:
             # Catch everything, not just OSError: whatever goes wrong, the staged file must not
-            # survive the failed write. A narrower clause has already leaked one once (os.replace
-            # raises ValueError, not OSError, on a NUL in the path), and it would also miss a
-            # CancelledError arriving mid-commit.
+            # survive the failed write. An `except OSError` is too narrow on both counts - a NUL
+            # in the path makes os.replace raise ValueError, and a CancelledError can arrive
+            # mid-commit - and either one escaping here leaves the temp file behind.
             with contextlib.suppress(OSError):
                 await self.discard_staged_file(normalised_sub_path, temporary_name)
             if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
@@ -340,6 +356,11 @@ class Session:
             os.unlink(filename, dir_fd=parent_fd)
 
     def get_sub_path(self, full_path: str):
+        """Convert an absolute host path into a session-relative one, rejecting anything outside.
+
+        Purely textual, so it says nothing about symlinks along the way - it is for paths the
+        API itself produced, not for anything a caller supplied.
+        """
         normalised_path = posixpath.normpath(full_path)
         if not normalised_path.startswith(self.work_directory + "/"):
             raise ValueError(f"Path {normalised_path!r} is not within the session directory ({self.work_directory!r})")
@@ -423,6 +444,9 @@ class SessionManager:
         except TimeoutError:
             raise SessionLockTimeout(session_id) from None
         try:
+            # Waiting for the lock is an await, and the sweep or an explicit delete can retire
+            # the session during it - the lock is then granted over a directory that is already
+            # gone. Re-check after acquiring, not just before.
             if self.get(session_id) is not session:
                 raise SessionNotFound(session_id)
             session.last_used = time.monotonic()

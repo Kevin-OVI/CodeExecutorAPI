@@ -1,3 +1,23 @@
+"""Acceptance harness: drives a *running* CodeExecutorAPI server over HTTP.
+
+    python harness.py --api-url http://127.0.0.1:40003
+    python harness.py --list
+
+Nothing here imports the API: every check talks to the server as a client does, which is what
+lets it cover what only exists once podman, the bind mount and the XFS quota are real - a
+symlink escape, an OOM kill, a quota refusal.
+
+A check is an `async def check_*` registered in CHECKS with its group and the number of fresh
+sessions the runner should create and destroy around it. Checks assert; the runner catches,
+so one failure does not end the run (`-x` if you want it to).
+
+Opt-in groups need a server whose limits are small enough to reach - a 20s EXECUTION_TIMEOUT
+is not something a check can wait out - so each names its requirement in GROUPS and stays off
+until its `--check-<group>` flag is passed. `Config` mirrors the server's limits rather than
+discovering them, so a limit set in the server's environment must be passed here too; every
+assertion derived from one names its flag on failure.
+"""
+
 import argparse
 import asyncio
 import contextlib

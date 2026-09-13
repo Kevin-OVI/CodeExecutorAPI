@@ -99,7 +99,7 @@ def _iter_session_files(work_directory: str) -> Iterator[tuple[str, os.stat_resu
 def _signature(entry_stat: os.stat_result) -> tuple[int, int, int, int]:
     """Cheap change-detection stamp for a regular file.
 
-    Replaces hashing the file's contents: one `lstat` instead of a full read. `st_ino`
+    A stamp rather than a content hash: one `lstat` instead of a full read. `st_ino`
     catches a delete-and-recreate, and `st_ctime_ns` catches an `mtime` rewound with
     `utimensat` (which bumps `ctime` itself) as well as any metadata-only change.
     """
@@ -107,6 +107,17 @@ def _signature(entry_stat: os.stat_result) -> tuple[int, int, int, int]:
 
 
 def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event, max_size: int = MAX_OUTPUT_SIZE) -> bytes:
+    """Drain the pty until the container exits, returning at most `max_size` bytes.
+
+    Runs in a worker thread and owns both fds, closing them on the way out.
+
+    Reading continues past `max_size` with the excess discarded: the container writes into a
+    fixed-size pty buffer, and a reader that stops wedges it in a write it never returns from.
+
+    `stop_evt` is the exit that fires; the 0.1s `select` timeout is what lets the thread see
+    it. This process holds its own `slave_fd` open throughout, so the master never reports EIO
+    when the container exits - that branch is a safety net, not the normal path.
+    """
     try:
         output = io.BytesIO()
         while True:
@@ -151,13 +162,20 @@ async def _remove_container(container_name: str) -> bool:
 
 
 class ExecutionEnvironment:
+    """One container run against a session, plus the before/after diff of its files.
+
+    Constructing this stamps every file in the session, so it must happen before the container
+    starts - `collect_changes` has nothing to compare against otherwise. Neither half takes a
+    lock; the caller's session lock is what keeps a concurrent write out.
+    """
+
     __slots__ = ("session", "language", "code", "container_name", "input_files")
 
-    def __init__(self, session: Session, langage: str, code):
-        if langage not in COMMANDS:
-            raise ValueError(f"Unsupported language: {langage}")
+    def __init__(self, session: Session, language: str, code: str):
+        if language not in COMMANDS:
+            raise ValueError(f"Unsupported language: {language}")
         self.session = session
-        self.language = langage
+        self.language = language
         self.code = code
 
         self.container_name = f"ce_{secrets.token_urlsafe(16)}"
