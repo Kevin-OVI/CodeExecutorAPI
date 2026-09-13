@@ -73,7 +73,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `MAX_CPU_CORES` (default: `1`)
 - `MAX_OUTPUT_SIZE` (default: `10485760` bytes)
 - `MAX_CODE_LENGTH` (default: `65536` bytes) - must stay below the kernel's `MAX_ARG_STRLEN` (128 KiB) since code is passed as a single `podman run` argv entry
-- `MAX_SESSION_SIZE` (default: `104857600` bytes)
+- `MAX_SESSION_SIZE` (default: `104857600` bytes) - maximum total bytes a session may hold, enforced as the XFS project quota's `bhard` and therefore only when `SESSION_QUOTA_MOUNTPOINT` is set. The API keeps no byte accounting of its own: a `PUT`, a seeded file and a file written by executed code all run into the same kernel limit, and none of them can be rejected for exceeding it when no quota is configured
 - `MAX_SESSION_ENTRIES` (default: `32768`) - maximum inodes (files, directories and symlinks alike) a session may hold, enforced as the XFS project quota's `ihard` alongside `MAX_SESSION_SIZE`; like the byte limit it only applies when `SESSION_QUOTA_MOUNTPOINT` is set. Creating past it fails inside the container the same way running out of disk does. Keep it comfortably above what a real workload installs - a scientific Python stack is roughly 15000 inodes
 - `MAX_RESULT_ATTACHMENTS` (default: `256`) - maximum changed files returned as `/execute` response parts. Anything beyond that is named in the response's `omitted_files`; readable files remain retrievable through the files API while a persistent session is live. Omitted files from a throwaway `/execute` session are not retrievable after the call; execution itself is never failed over this
 - `MAX_SESSIONS` (default: `64`)
@@ -90,14 +90,14 @@ The service reads these environment variables at import/startup (see `code_execu
 - `SESSION_SWEEP_INTERVAL_SECONDS` (default: `60`) - how often the expiry sweep runs
 - `SESSION_LOCK_WAIT_TIMEOUT_SECONDS` (default: `30`) - how long a request waits for a session's lock (or an execution slot) before returning `409`/`503`
 - `SESSION_ROOT_DIRECTORY` (default: the system temporary directory) - base directory for session working directories
-- `SESSION_QUOTA_MOUNTPOINT` (default: unset) - XFS mountpoint containing `SESSION_ROOT_DIRECTORY`; when set, `MAX_SESSION_SIZE` and `MAX_SESSION_ENTRIES` are enforced as hard, kernel-level XFS project quotas per session (see below). When unset, `MAX_SESSION_SIZE` is only enforced against host-mediated writes (`PUT`/seed/attachment uploads) and `MAX_SESSION_ENTRIES` not at all - code running inside the container can otherwise write past both, bounded only by `CONTAINER_ULIMIT_FSIZE` per file and `EXECUTION_TIMEOUT`
+- `SESSION_QUOTA_MOUNTPOINT` (default: unset) - XFS mountpoint containing `SESSION_ROOT_DIRECTORY`; when set, `MAX_SESSION_SIZE` and `MAX_SESSION_ENTRIES` are enforced as hard, kernel-level XFS project quotas per session (see below). When unset, neither limit is enforced at all: host-mediated writes (`PUT`/seed/attachment uploads) and code running inside the container alike can fill a session until the filesystem itself runs out, bounded only by `CONTAINER_ULIMIT_FSIZE` per individual file and by `EXECUTION_TIMEOUT`. Leaving it unset therefore requires starting the server with `--no-session-quota`, which exists as a development convenience and is not a supported production configuration
 - `SESSION_QUOTA_COMMAND` (default: `xfs_quota`) - argv prefix used to run `xfs_quota`, split like a shell command line but exec'd directly. Set it to `sudo -n /usr/sbin/xfs_quota` when the API runs unprivileged and `CAP_SYS_ADMIN` is delegated through a scoped sudoers rule (see below)
 
 Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE` via its own environment.
 
 ### Enforcing `MAX_SESSION_SIZE` with an XFS project quota
 
-Without `SESSION_QUOTA_MOUNTPOINT`, `MAX_SESSION_SIZE` only bounds files written through the API itself; it does not cap what executed code writes directly into the session's mounted working directory. To get a real, kernel-enforced cap that also covers code execution, put `SESSION_ROOT_DIRECTORY` on an XFS filesystem with project quotas enabled:
+Without `SESSION_QUOTA_MOUNTPOINT`, `MAX_SESSION_SIZE` is not enforced at all - neither against files written through the API nor against what executed code writes directly into the session's mounted working directory - which is why the server refuses to start unless `--no-session-quota` says that is intended. The quota is the only mechanism that enforces it, so put `SESSION_ROOT_DIRECTORY` on an XFS filesystem with project quotas enabled:
 
 ```bash
 apt install xfsprogs
@@ -168,6 +168,12 @@ Override host/port from CLI:
 python app.py --host 127.0.0.1 --port 40003
 ```
 
+Startup fails with a missing-variable error when `SESSION_QUOTA_MOUNTPOINT` is not set, since nothing else enforces `MAX_SESSION_SIZE`/`MAX_SESSION_ENTRIES`. Pass `--no-session-quota` to start anyway - a development convenience that logs a warning and leaves both limits unenforced:
+
+```cmd
+python app.py --no-session-quota
+```
+
 ## API
 
 ### Health check
@@ -205,6 +211,7 @@ curl -X DELETE http://127.0.0.1:40003/sessions/{session_id}/files/some/path.txt
 
 - `GET`/`PUT`/`DELETE` on a file return `404` if the session or file doesn't exist.
 - `PUT` creates or overwrites the file (parent directories are created as needed); the request body is the raw file bytes.
+- `PUT` (like seeded files and `/execute` attachments) returns `413` when the write is refused by the session's XFS quota or exceeds the per-file `CONTAINER_ULIMIT_FSIZE` cap. The body is streamed to a temporary file first, so a rejected write never leaves a truncated file behind. Without `SESSION_QUOTA_MOUNTPOINT` only the per-file cap applies, and a session's total size is unbounded.
 - `GET` on a **directory** returns a JSON listing of that one level instead of file bytes; an empty path lists the session root. Unlike execution results the listing hides nothing - hidden directories and symlinks are included - so it is the way to discover files that `/execute` excluded or omitted. Symlinks are reported, never followed.
 
 ```json
@@ -264,7 +271,7 @@ Runs a broad set of smoke checks against a running server: session/file lifecycl
 
 Three checks cover result collection specifically, each on its own session: repeated no-op runs must report nothing as changed for both API-uploaded and container-created files (this is what catches a broken `--userns=keep-id` mapping); hidden `$HOME` directories must be excluded from attachments while staying reachable through the files API; and creating more than `MAX_RESULT_ATTACHMENTS` files must yield a capped, still-successful response whose `omitted_files` are individually retrievable. Pass `--max-result-attachments` if the server's value differs from the default.
 
-`--check-quota` additionally verifies that `MAX_SESSION_SIZE` and `MAX_SESSION_ENTRIES` are enforced from *inside* the container, by writing past each and expecting an `ENOSPC` failure - only meaningful once `SESSION_QUOTA_MOUNTPOINT` is configured and working (see above), so it's opt-in; pass `--max-session-size`/`--max-session-entries` to match the server's configured values if they differ from the defaults.
+`--check-quota` additionally verifies that `MAX_SESSION_SIZE` and `MAX_SESSION_ENTRIES` are enforced from *inside* the container, by writing past each and expecting an `ENOSPC` failure, and that the same byte limit stops a host-mediated write by `PUT`ting past it and expecting a `413`. Since the API keeps no byte accounting of its own, that `413` is the quota rejecting the write - the check is the only thing covering that path. All three are only meaningful once `SESSION_QUOTA_MOUNTPOINT` is configured and working (see above), so they're opt-in; pass `--max-session-size`/`--max-session-entries` to match the server's configured values if they differ from the defaults.
 
 ## Project Layout
 
@@ -273,7 +280,7 @@ Three checks cover result collection specifically, each on its own session: repe
 - `code_executor_api/app_factory.py` - app wiring, startup, and cleanup hooks
 - `code_executor_api/config.py` - environment-backed constants
 - `code_executor_api/validation.py` - sub_path normalization, language/null-byte validation
-- `code_executor_api/file_helpers.py` - size-limited streaming reads/writes shared by sessions and file uploads
+- `code_executor_api/file_helpers.py` - streaming reads/writes (bounded per file) shared by sessions and file uploads
 - `code_executor_api/sessions.py` - `Session`/`SessionManager`: locking, creation/deletion, expiry sweep, and (when `SESSION_QUOTA_MOUNTPOINT` is set) per-session XFS project quota setup
 - `code_executor_api/executor/podman_executor.py` - Podman container invocation and file-diffing
 - `code_executor_api/routes/` - `/sessions`, `/sessions/{id}/files/{path}`, `/execute` (and `/sessions/{id}/execute`), `/health` handlers

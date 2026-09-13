@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import contextlib
 import io
 import os
@@ -16,22 +14,6 @@ from aiohttp.web import HTTPRequestEntityTooLarge
 type _Reader = Callable[[int], Awaitable[bytes]]
 type _EOFPredicate = Callable[[], bool]
 type SupportedContentType = BodyPartReader | StreamReader | bytes
-
-
-class ContentSizeLimiter:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
-        self.actual_size = 0
-
-    def add(self, size: int) -> None:
-        self.actual_size += size
-        if self.actual_size > self.max_size:
-            raise HTTPRequestEntityTooLarge(max_size=self.max_size, actual_size=self.actual_size)
-
-    def reduced_max(self, max_size: int) -> ContentSizeLimiter:
-        if self.max_size > max_size:
-            return ContentSizeLimiter(max_size)
-        return self
 
 
 def _prepare_reader(content: SupportedContentType) -> tuple[_Reader, _EOFPredicate]:
@@ -64,7 +46,6 @@ async def _write_content(
         reader: _Reader,
         at_eof: _EOFPredicate,
         max_size: int,
-        size_limiter: ContentSizeLimiter | None,
 ) -> int:
     actual_size = 0
     while not at_eof():
@@ -74,23 +55,16 @@ async def _write_content(
         actual_size += len(chunk)
         if actual_size > max_size:
             raise HTTPRequestEntityTooLarge(max_size=max_size, actual_size=actual_size)
-        if size_limiter is not None:
-            size_limiter.add(len(chunk))
         await f.write(chunk)
     return actual_size
 
 
-async def write_file_content(
-        f,
-        content: SupportedContentType,
-        max_size: int,
-        size_limiter: ContentSizeLimiter | None = None,
-) -> int:
+async def write_file_content(f, content: SupportedContentType, max_size: int) -> int:
     reader, at_eof = _prepare_reader(content)
-    return await _write_content(f, reader, at_eof, max_size, size_limiter)
+    return await _write_content(f, reader, at_eof, max_size)
 
 
-async def read_content(content: SupportedContentType, max_size: int, size_limiter: ContentSizeLimiter | None = None) -> bytes:
+async def read_content(content: SupportedContentType, max_size: int) -> bytes:
     reader, at_eof = _prepare_reader(content)
     writer = io.BytesIO()
     actual_size = 0
@@ -101,8 +75,6 @@ async def read_content(content: SupportedContentType, max_size: int, size_limite
         actual_size += len(chunk)
         if actual_size > max_size:
             raise HTTPRequestEntityTooLarge(max_size=max_size, actual_size=actual_size)
-        if size_limiter is not None:
-            size_limiter.add(len(chunk))
         writer.write(chunk)
     return writer.getvalue()
 
@@ -111,7 +83,6 @@ async def write_file_to_temp(
         parent_fd: int,
         content: SupportedContentType,
         max_size: int,
-        size_limiter: ContentSizeLimiter | None = None,
 ) -> tuple[str, int]:
     """Write `content` to a hidden temp file inside the directory referenced by `parent_fd`,
     without making it visible under any final name yet. Returns (temporary_name, size); the
@@ -122,7 +93,7 @@ async def write_file_to_temp(
     try:
         async with aopen(fd, "wb", closefd=True) as f:
             fd = None
-            size = await write_file_content(f, content, max_size, size_limiter)
+            size = await write_file_content(f, content, max_size)
     except BaseException:
         if fd is not None:
             os.close(fd)

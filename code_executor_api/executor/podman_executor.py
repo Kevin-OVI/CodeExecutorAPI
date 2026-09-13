@@ -252,16 +252,14 @@ class ExecutionEnvironment:
         Both lists are sorted, so a caller that has to truncate cuts deterministically.
         """
         changed_files = []
-        files_size: dict[str, int] = {}
+        current_files: set[str] = set()
         for sub_path, entry_stat in _iter_session_files(self.session.work_directory):
-            files_size[sub_path] = entry_stat.st_size
+            current_files.add(sub_path)
             if self.input_files.get(sub_path) != _signature(entry_stat):
                 changed_files.append(sub_path)
 
-        self.session.files_size = files_size
-
         changed_files.sort()
-        return changed_files, sorted(self.input_files.keys() - files_size.keys())
+        return changed_files, sorted(self.input_files.keys() - current_files)
 
 
 async def run_code_async(session: Session, language: str, code: str) -> CodeExecutionResult:

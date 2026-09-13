@@ -2,8 +2,6 @@ import logging
 
 from aiohttp import web
 
-from ..config import MAX_SESSION_SIZE
-from ..file_helpers import ContentSizeLimiter
 from ..sessions import (
     QuotaSetupFailed,
     SessionLimitReached,
@@ -29,13 +27,12 @@ async def handle_create_session(request: web.Request) -> web.Response:
 
     content_type = request.content_type
     if content_type == "multipart/form-data":
-        size_limiter = ContentSizeLimiter(MAX_SESSION_SIZE)
         try:
             reader = await request.multipart()
             async for part in reader:
                 if part.filename is None:
                     raise web.HTTPBadRequest(text="Multipart parts must be files")
-                await session.write_file(part.filename, part, size_limiter)
+                await session.write_file(part.filename, part)
         except SessionResourceLimitReached as exc:
             await session_manager.delete(session.id)
             return web.json_response({"error": str(exc)}, status=413)

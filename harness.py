@@ -172,20 +172,44 @@ async def check_readonly_root_filesystem(session: aiohttp.ClientSession, api_url
     assert "read-only" in result["output"].lower(), f"Unexpected failure mode: {result['output']!r}"
 
 
-async def check_disk_quota_enforcement(session: aiohttp.ClientSession, api_url: str, session_id: str, max_session_size: int) -> None:
-    result = await _execute(session, api_url, "bash", "dd if=/dev/zero of=small.bin bs=1M count=1 2>&1", session_id=session_id)
-    print(f"Disk quota probe (1MiB write): output={result['output']!r} return_code={result['return_code']}")
-    assert result["return_code"] == 0, f"A small write well under the quota unexpectedly failed: {result['output']!r}"
+async def check_disk_quota_enforcement(session: aiohttp.ClientSession, api_url: str, max_session_size: int) -> None:
+    """Check that MAX_SESSION_SIZE stops both writers: executed code and the API itself.
 
-    probe_mib = max_session_size // (1024 * 1024) + 16
-    result = await _execute(session, api_url, "bash", f"dd if=/dev/zero of=quota_probe.bin bs=1M count={probe_mib} 2>&1", session_id=session_id)
-    print(f"Disk quota probe ({probe_mib}MiB write): output={result['output']!r} return_code={result['return_code']}")
-    assert result["return_code"] != 0, (
-        "Writing well past --max-session-size from inside the container succeeded -- "
-        "the session directory does not appear to be under an XFS project quota "
-        "(check SESSION_QUOTA_MOUNTPOINT and that xfs_quota is usable by the API process)"
-    )
-    assert "no space" in result["output"].lower(), f"Unexpected failure mode, expected an ENOSPC error: {result['output']!r}"
+    Runs on its own session, because the probe deliberately fills it to its byte quota and
+    leaves it there - every later write into a shared session would then fail.
+    """
+    session_id = await _new_session(session, api_url)
+    try:
+        result = await _execute(session, api_url, "bash", "dd if=/dev/zero of=small.bin bs=1M count=1 2>&1", session_id=session_id)
+        print(f"Disk quota probe (1MiB write): output={result['output']!r} return_code={result['return_code']}")
+        assert result["return_code"] == 0, f"A small write well under the quota unexpectedly failed: {result['output']!r}"
+
+        probe_mib = max_session_size // (1024 * 1024) + 16
+        result = await _execute(session, api_url, "bash", f"dd if=/dev/zero of=quota_probe.bin bs=1M count={probe_mib} 2>&1", session_id=session_id)
+        print(f"Disk quota probe ({probe_mib}MiB write): output={result['output']!r} return_code={result['return_code']}")
+        assert result["return_code"] != 0, (
+            "Writing well past --max-session-size from inside the container succeeded -- "
+            "the session directory does not appear to be under an XFS project quota "
+            "(check SESSION_QUOTA_MOUNTPOINT and that xfs_quota is usable by the API process)"
+        )
+        assert "no space" in result["output"].lower(), f"Unexpected failure mode, expected an ENOSPC error: {result['output']!r}"
+
+        # The session now sits at its byte quota, so a host-mediated write has to be refused
+        # too. The API keeps no byte accounting of its own - this 413 is the quota rejecting
+        # the write, so it is the only check covering that path.
+        upload_url = f"{api_url}/sessions/{session_id}/files/host_probe.bin"
+        async with session.put(upload_url, data=b"x" * 65536) as response:
+            body = await response.text()
+        assert response.status == 413, (
+            f"Expected 413 for a PUT into a session already at its byte quota, got {response.status}: {body}"
+        )
+        print(f"PUT into a session at its quota -> 413 {body}")
+
+        async with session.get(upload_url) as response:
+            assert response.status == 404, f"A rejected PUT left a file behind: {response.status}"
+        print("GET the rejected upload -> 404 (as expected, nothing was left behind)")
+    finally:
+        await session.delete(f"{api_url}/sessions/{session_id}")
 
 
 async def check_rejected_execute_leaves_no_attachment(session: aiohttp.ClientSession, api_url: str, session_id: str) -> None:
@@ -468,7 +492,8 @@ async def run(
         await check_readonly_root_filesystem(session, api_url, session_id)
         await check_directory_listing(session, api_url, session_id)
         if check_quota:
-            await check_disk_quota_enforcement(session, api_url, session_id, max_session_size)
+            # Both run on their own sessions: they fill one to its quota by design.
+            await check_disk_quota_enforcement(session, api_url, max_session_size)
             await check_inode_quota_enforcement(session, api_url, max_session_entries)
         else:
             print("Skipping disk/inode quota checks (pass --check-quota once SESSION_QUOTA_MOUNTPOINT is configured)")
@@ -498,7 +523,8 @@ if __name__ == "__main__":
     parser.add_argument("--api-url", default="http://127.0.0.1:40003", help="Base URL for the API server")
     parser.add_argument(
         "--check-quota", action="store_true",
-        help="Also verify MAX_SESSION_SIZE and MAX_SESSION_ENTRIES are enforced from inside the container "
+        help="Also verify MAX_SESSION_SIZE and MAX_SESSION_ENTRIES are enforced from inside the container, "
+             "and that MAX_SESSION_SIZE also stops a PUT "
              "(requires the server's SESSION_QUOTA_MOUNTPOINT to be configured with a working XFS project quota setup)",
     )
     parser.add_argument(

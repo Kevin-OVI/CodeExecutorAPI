@@ -30,7 +30,7 @@ from .config import (
     SESSION_ROOT_DIRECTORY,
     SESSION_SWEEP_INTERVAL_SECONDS,
 )
-from .file_helpers import ContentSizeLimiter, SupportedContentType, read_file, write_file_to_temp
+from .file_helpers import SupportedContentType, read_file, write_file_to_temp
 from .validation import normalize_sub_path
 
 LOGGER = logging.getLogger(__name__)
@@ -170,15 +170,7 @@ class Session:
     work_directory: str
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     last_used: float = dataclasses.field(default_factory=time.monotonic)
-    files_size: dict[str, int] = dataclasses.field(default_factory=dict)
     project_id: int | None = None
-
-    @property
-    def total_file_size(self) -> int:
-        return sum(self.files_size.values())
-
-    def get_maximum_allowed_size(self, sub_path: str) -> int:
-        return MAX_SESSION_SIZE - self.total_file_size + self.files_size.get(sub_path, 0)
 
     @contextlib.contextmanager
     def _open_parent(self, normalised_sub_path: str, create_dir: bool):
@@ -203,16 +195,6 @@ class Session:
             yield parent_fd, path_parts[-1], normalised_sub_path
         finally:
             os.close(parent_fd)
-
-    @staticmethod
-    def _get_existing_file(parent_fd: int, filename: str) -> tuple[bool, int]:
-        try:
-            file_stat = os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False, 0
-        if stat.S_ISDIR(file_stat.st_mode):
-            raise IsADirectoryError(filename)
-        return True, file_stat.st_size if stat.S_ISREG(file_stat.st_mode) else 0
 
     def read_file(self, sub_path: str, field_name: str | None = None) -> IOBasePayload:
         normalised_sub_path = normalize_sub_path(sub_path)
@@ -275,19 +257,24 @@ class Session:
         entries.sort(key=lambda entry: entry["name"])
         return {"path": normalised_sub_path, "entries": entries}
 
-    async def stage_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter) -> tuple[str, str]:
+    async def stage_file(self, sub_path: str, content: SupportedContentType) -> tuple[str, str]:
         """Write `content` to a hidden temp file inside sub_path's parent directory, without
         making it visible under `sub_path` yet. Returns (normalised_sub_path, temporary_name)
-        to later pass to commit_staged_file (reveal it) or discard_staged_file (drop it)."""
+        to later pass to commit_staged_file (reveal it) or discard_staged_file (drop it).
+
+        The session's total size is not tracked here: MAX_SESSION_SIZE is the XFS project
+        quota's job, so a host-mediated write runs into exactly the same kernel limit as one
+        made by code running in the container. Only the per-file CONTAINER_ULIMIT_FSIZE cap
+        is applied in userspace, matching the `RLIMIT_FSIZE` the container itself runs under.
+        """
         normalised_sub_path = normalize_sub_path(sub_path)
-        size_limiter = size_limiter.reduced_max(self.get_maximum_allowed_size(normalised_sub_path))
         try:
             with self._open_parent(normalised_sub_path, True) as (parent_fd, _, _):
-                temporary_name, _ = await write_file_to_temp(parent_fd, content, CONTAINER_ULIMIT_FSIZE, size_limiter)
+                temporary_name, _ = await write_file_to_temp(parent_fd, content, CONTAINER_ULIMIT_FSIZE)
         except HTTPRequestEntityTooLarge:
-            # Same outward error (413, JSON body) whether the tracked-bytes limiter or the
-            # OS-enforced XFS quota below is what actually rejected the write.
-            raise SessionResourceLimitReached("Session storage limit reached") from None
+            # Same outward error (413, JSON body) whether the per-file cap or the OS-enforced
+            # XFS quota below is what actually rejected the write.
+            raise SessionResourceLimitReached("File size limit reached") from None
         except OSError as exc:
             if exc.errno == errno.ENOSPC or exc.errno == errno.EDQUOT:
                 raise SessionResourceLimitReached("Session storage or file count limit reached") from None
@@ -296,17 +283,15 @@ class Session:
 
     async def commit_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
         with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
-            size = os.stat(temporary_name, dir_fd=parent_fd).st_size
             os.replace(temporary_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        self.files_size[normalised_sub_path] = size
 
     async def discard_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
         with self._open_parent(normalised_sub_path, False) as (parent_fd, _, _):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(temporary_name, dir_fd=parent_fd)
 
-    async def write_file(self, sub_path: str, content: SupportedContentType, size_limiter: ContentSizeLimiter):
-        normalised_sub_path, temporary_name = await self.stage_file(sub_path, content, size_limiter)
+    async def write_file(self, sub_path: str, content: SupportedContentType):
+        normalised_sub_path, temporary_name = await self.stage_file(sub_path, content)
         try:
             await self.commit_staged_file(normalised_sub_path, temporary_name)
         except OSError as exc:
@@ -322,7 +307,6 @@ class Session:
             if stat.S_ISDIR(os.stat(filename, dir_fd=parent_fd, follow_symlinks=False).st_mode):
                 raise IsADirectoryError(filename)
             os.unlink(filename, dir_fd=parent_fd)
-            self.files_size.pop(normalised_sub_path, None)
 
     def get_sub_path(self, full_path: str):
         normalised_path = posixpath.normpath(full_path)

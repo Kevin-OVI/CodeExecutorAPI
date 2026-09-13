@@ -3,9 +3,9 @@ import logging
 
 from aiohttp import MultipartWriter, web
 
-from ..config import MAX_CODE_LENGTH, MAX_RESULT_ATTACHMENTS, MAX_SESSION_SIZE
+from ..config import MAX_CODE_LENGTH, MAX_RESULT_ATTACHMENTS
 from ..executor import run_code_async
-from ..file_helpers import ContentSizeLimiter, read_content
+from ..file_helpers import read_content
 from ..sessions import (
     ExecutionLimitReached,
     QuotaSetupFailed,
@@ -42,7 +42,6 @@ async def handle_execute(request: web.Request) -> web.Response:
         async with session_manager.locked(session_id) as session:
             language: str | None = None
             code: str | None = None
-            size_limiter = ContentSizeLimiter(MAX_SESSION_SIZE)
             staged: list[tuple[str, str]] = []
 
             try:
@@ -55,7 +54,7 @@ async def handle_execute(request: web.Request) -> web.Response:
                     elif part.name == "attachments":
                         if part.filename is None:
                             return web.json_response({"error": "attachments parts must be files"}, status=400)
-                        staged.append(await session.stage_file(part.filename, part, size_limiter))
+                        staged.append(await session.stage_file(part.filename, part))
                     else:
                         return web.json_response({"error": f"Unsupported multipart field: {part.name}"}, status=400)
 
