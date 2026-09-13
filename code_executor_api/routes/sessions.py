@@ -1,6 +1,7 @@
 import logging
 
 from aiohttp import web
+from aiohttp.http_exceptions import BadHttpMessage
 
 from ..sessions import (
     QuotaSetupFailed,
@@ -10,6 +11,7 @@ from ..sessions import (
     SessionNotFound,
     SessionResourceLimitReached,
 )
+from ..validation import ValidationError
 
 __all__ = ("handle_create_session", "handle_delete_session")
 LOGGER = logging.getLogger(__name__)
@@ -31,11 +33,16 @@ async def handle_create_session(request: web.Request) -> web.Response:
             reader = await request.multipart()
             async for part in reader:
                 if part.filename is None:
-                    raise web.HTTPBadRequest(text="Multipart parts must be files")
+                    raise ValidationError("Multipart parts must be files")
                 await session.write_file(part.filename, part)
         except SessionResourceLimitReached as exc:
             await session_manager.delete(session.id)
             return web.json_response({"error": str(exc)}, status=413)
+        except BadHttpMessage:
+            # A part header aiohttp cannot parse - a NUL in a seed filename, say. It carries a
+            # 400 code but is not an HTTPException, so without this it would surface as a 500.
+            await session_manager.delete(session.id)
+            return web.json_response({"error": "Request body is not valid multipart/form-data"}, status=400)
         except Exception:
             await session_manager.delete(session.id)
             raise

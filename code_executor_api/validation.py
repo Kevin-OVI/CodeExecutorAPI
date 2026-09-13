@@ -17,6 +17,11 @@ class ValidationError(HTTPBadRequest):
 
 
 def normalize_sub_path(filename: str) -> str:
+    # A NUL cannot survive the syscall that would open the path: os.open raises ValueError,
+    # not OSError, so it escapes the handlers' except chains and becomes a 500. Reject it
+    # here, where every path on every surface passes through.
+    if "\x00" in filename:
+        raise ValidationError("Invalid file path: null bytes are not allowed")
     normalized = posixpath.normpath(filename.lstrip("/"))
     if normalized in ("", ".", "..") or normalized.startswith("../"):
         raise ValidationError("Invalid file path: cannot access a path higher than the root")

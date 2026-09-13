@@ -2,6 +2,7 @@ import contextlib
 import logging
 
 from aiohttp import MultipartWriter, web
+from aiohttp.http_exceptions import BadHttpMessage
 
 from ..config import MAX_CODE_LENGTH, MAX_RESULT_ATTACHMENTS
 from ..executor import run_code_async
@@ -34,6 +35,12 @@ async def handle_execute(request: web.Request) -> web.Response:
     session_id: str | None = request.match_info.get("session_id")
     ephemeral = session_id is None
 
+    # Checked before anything else, including creating the ephemeral session: request.multipart()
+    # fails inside aiohttp's own parser on a body that is not multipart, so there is no point
+    # standing a session up only to tear it down again for a request already known to be bad.
+    if request.content_type != "multipart/form-data":
+        return web.json_response({"error": "Request must be multipart/form-data"}, status=400)
+
     try:
         if ephemeral:
             session_id = (await session_manager.create()).id
@@ -45,26 +52,50 @@ async def handle_execute(request: web.Request) -> web.Response:
             staged: list[tuple[str, str]] = []
 
             try:
-                reader = await request.multipart()
-                async for part in reader:
-                    if part.name == "language":
-                        language = (await _read_text_part(part, 64)).strip()
-                    elif part.name == "code":
-                        code = await _read_text_part(part, MAX_CODE_LENGTH)
-                    elif part.name == "attachments":
-                        if part.filename is None:
-                            return web.json_response({"error": "attachments parts must be files"}, status=400)
-                        staged.append(await session.stage_file(part.filename, part))
-                    else:
-                        return web.json_response({"error": f"Unsupported multipart field: {part.name}"}, status=400)
+                try:
+                    reader = await request.multipart()
+                    async for part in reader:
+                        if part.name == "language":
+                            try:
+                                language = (await _read_text_part(part, 64)).strip()
+                            except web.HTTPRequestEntityTooLarge:
+                                # The cap itself is right - the field should not be unbounded -
+                                # but a string that long names no supported language, which is
+                                # invalid input, not a request-size problem.
+                                raise ValidationError("Language is unsupported") from None
+                        elif part.name == "code":
+                            code = await _read_text_part(part, MAX_CODE_LENGTH)
+                        elif part.name == "attachments":
+                            if part.filename is None:
+                                return web.json_response({"error": "attachments parts must be files"}, status=400)
+                            staged.append(await session.stage_file(part.filename, part))
+                        else:
+                            return web.json_response({"error": f"Unsupported multipart field: {part.name}"}, status=400)
+                except (AssertionError, ValueError, BadHttpMessage) as exc:
+                    # A body that claims multipart but is malformed some other way fails inside
+                    # the parser rather than in any validation of ours: a missing boundary
+                    # parameter raises ValueError, and a part header aiohttp cannot parse - a NUL
+                    # in an attachment filename, say - raises BadHttpMessage, which carries a 400
+                    # code but is not an HTTPException, so nothing converts it on its own.
+                    #
+                    # Nothing else raised above derives from any of these: the API's own errors
+                    # are plain Exceptions or HTTPExceptions, and the one ValueError subclass in
+                    # reach, UnicodeDecodeError, is already converted by _read_text_part.
+                    raise ValidationError("Request body is not valid multipart/form-data") from exc
 
                 validate_language(language)
                 validate_code(code)
                 assert language is not None and code is not None
 
-                for normalised_sub_path, temporary_name in staged:
+                # Drop each entry as it lands, so the `finally` below discards exactly those
+                # attachments that were never committed. This is not atomic - os.replace has
+                # overwritten the previous content by the time a later one fails - but a
+                # mid-loop failure no longer leaves committed entries queued for a discard that
+                # cannot apply to them.
+                while staged:
+                    normalised_sub_path, temporary_name = staged[0]
                     await session.commit_staged_file(normalised_sub_path, temporary_name)
-                staged.clear()
+                    staged.pop(0)
             finally:
                 for normalised_sub_path, temporary_name in staged:
                     with contextlib.suppress(OSError):

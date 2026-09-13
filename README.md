@@ -66,7 +66,7 @@ pip install -r requirements.txt
 
 The service reads these environment variables at import/startup (see `code_executor_api/config.py`):
 
-- `HOST` (default: `0.0.0.0`)
+- `HOST` (default: `127.0.0.1`) - loopback by default, because the API is unauthenticated and executed code has a routable path back to the host. Binding wider is a deliberate decision; see [Hardening](#hardening) before making it
 - `PORT` (default: `40003`)
 - `EXECUTION_TIMEOUT` (default: `20` seconds)
 - `MAX_MEMORY` (default: `256M`)
@@ -84,6 +84,7 @@ The service reads these environment variables at import/startup (see `code_execu
 - `CONTAINER_ULIMIT_FSIZE` (default: `268435456` bytes)
 - `CONTAINER_RELATIVE_NICENESS` (default: `5`)
 - `CONTAINER_TMPFS_SIZE` (default: `64m`)
+- `CONTAINER_NETWORK` (default: `bridge`) - the podman network executed code runs on, passed straight to `podman run --net`. The default bridge reaches the host, and therefore whatever the host exposes on it; point this at a dedicated network firewalled off `PORT` to keep outbound access while denying the sandbox a route back to the API. See [Hardening](#hardening)
 - `PODMAN_IMAGE` (default: `code_executor`)
 - `PODMAN_CHECK_TIMEOUT_SECONDS` (default: `5`)
 - `SESSION_INACTIVITY_TIMEOUT_SECONDS` (default: `1800`) - idle sessions are deleted after this long
@@ -94,6 +95,58 @@ The service reads these environment variables at import/startup (see `code_execu
 - `SESSION_QUOTA_COMMAND` (default: `xfs_quota`) - argv prefix used to run `xfs_quota`, split like a shell command line but exec'd directly. Set it to `sudo -n /usr/sbin/xfs_quota` when the API runs unprivileged and `CAP_SYS_ADMIN` is delegated through a scoped sudoers rule (see below)
 
 Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE` via its own environment.
+
+## Hardening
+
+### The sandbox can reach whatever the host exposes on its bridge
+
+Containers run with `--net=$CONTAINER_NETWORK`, which defaults to podman's `bridge`. That gives executed code a routable path to the host - `host.containers.internal`, `host.docker.internal` and the bridge gateway address all resolve from inside - so **anything the host listens on with a non-loopback binding is reachable from the code being executed**. That includes this API.
+
+This is not derivable from the flag list, and it is the assumption the per-container limits are implicitly making: `--pids-limit`, `--memory` and `--cpus` bound *one* container, but code that can reach the API does not have to defeat any of them. It calls `POST /execute` and gets another container with a fresh budget. `MAX_CONCURRENT_EXECUTIONS` still caps the total, so there is a ceiling; what changes is that a single submission's resource envelope is no longer the per-container limits.
+
+What it allows, stated precisely:
+
+- **Denial of service.** `POST /sessions` until `MAX_SESSIONS` is exhausted, after which every legitimate caller gets `503`. Sessions expire after `SESSION_INACTIVITY_TIMEOUT_SECONDS`, so holding the condition just means re-creating them. `MAX_CONCURRENT_EXECUTIONS` can be saturated the same way. On disk that is `MAX_SESSIONS` × `MAX_SESSION_SIZE`, or unbounded when `SESSION_QUOTA_MOUNTPOINT` is unset.
+- **Resource amplification**, as above.
+
+What it does **not** allow is cross-session data access. There is no enumeration endpoint - every session-scoped route carries `{session_id}` in its path and nothing lists sessions. Session ids are 128 bits from a CSPRNG, so they are neither brute-forceable nor predictable from an id the caller legitimately owns. The id never reaches the container either: the working directory is an independently random `mkdtemp` name, so although `/proc/self/mountinfo` exposes the host path of the bind mount, the name it reveals is unrelated to the session id, and nothing passes the id in as an environment variable or argument. Reading another caller's files requires an id obtained some other way - a client leaking one, not the API disclosing it.
+
+Note that none of this is sandbox-specific. An unauthenticated API bound to `0.0.0.0` answers anything that can route to the host - other containers, the LAN - and sandboxed code is simply one of those callers, not a privileged one.
+
+### Closing it
+
+Two independent controls. Neither depends on the other, and applying both is the intended production posture.
+
+**1. Keep the API on loopback.** `HOST` defaults to `127.0.0.1`, so the default configuration is already closed. If you need remote callers, put a reverse proxy that terminates authentication in front of it rather than binding the API itself wider.
+
+**2. Isolate the container network.** This is what covers the case where the API *must* bind beyond loopback, and it is worth doing regardless. Create a dedicated network:
+
+```bash
+podman network create code_executor_sandbox
+podman network inspect code_executor_sandbox --format '{{range .Subnets}}{{.Subnet}}{{end}}'
+```
+
+Drop traffic from that subnet to the API's port (substitute the subnet printed above and your `PORT`):
+
+```bash
+sudo nft add table inet code_executor
+sudo nft 'add chain inet code_executor input { type filter hook input priority 0; }'
+sudo nft add rule inet code_executor input ip saddr 10.89.0.0/24 tcp dport 40003 drop
+```
+
+Then point the API at it:
+
+```bash
+export CONTAINER_NETWORK=code_executor_sandbox
+```
+
+This blocks only the API's port. The image's tooling (`requests`, `yt-dlp`, `dnsutils`) keeps its outbound access, which the harness's `outbound_network` check asserts.
+
+Verify both with the harness - `api_unreachable_from_sandbox` probes the host aliases on the API's own port from inside a container:
+
+```bash
+python harness.py --only api_unreachable_from_sandbox outbound_network
+```
 
 ### Enforcing `MAX_SESSION_SIZE` with an XFS project quota
 
@@ -264,14 +317,72 @@ Error statuses: `400` invalid input (bad language, invalid path), `404` missing 
 ```cmd
 python harness.py
 python harness.py --api-url http://127.0.0.1:40003
-python harness.py --check-quota --max-session-size 104857600 --max-session-entries 32768
+python harness.py --list
+python harness.py --only results --skip-heavy
 ```
 
-Runs a broad set of smoke checks against a running server: session/file lifecycle (`PUT`/`GET`/`DELETE`, seeded session creation), `/execute` file persistence and deletion detection across two calls sharing a `session_id`, execute attachments, directory listing, ephemeral `/execute`, and error-path checks (unknown session, unsupported language, path traversal). It also verifies sandbox hardening: a symlink created by executed code is neither exposed as an attachment nor followed by the files API, a symlinked directory can't be used to escape the session root via `GET`/`PUT`, and the container's root filesystem is confirmed read-only.
+`harness.py` drives a running server over HTTP and asserts the behaviour this README documents. It has no dependencies beyond the ones the API already needs. Every check is an `assert`, so it refuses to run under `python -O`.
 
-Three checks cover result collection specifically, each on its own session: repeated no-op runs must report nothing as changed for both API-uploaded and container-created files (this is what catches a broken `--userns=keep-id` mapping); hidden `$HOME` directories must be excluded from attachments while staying reachable through the files API; and creating more than `MAX_RESULT_ATTACHMENTS` files must yield a capped, still-successful response whose `omitted_files` are individually retrievable. Pass `--max-result-attachments` if the server's value differs from the default.
+Checks are grouped, and `--list` prints the registry: each check's name, its group, whether it is heavy, and a one-line summary. `--only` and `--skip` take either a check name or a group name. A run executes every selected check even after one fails, prints a `PASS`/`FAIL`/`ERROR`/`SKIP` line for each, and ends with a summary, a non-zero exit code if anything failed, and the exact `--only` command to re-run just the failures. `-x` stops at the first failure instead; `--skip-heavy` drops the checks that stress the host (fork bombs, large allocations, multi-megabyte transfers).
 
-`--check-quota` additionally verifies that `MAX_SESSION_SIZE` and `MAX_SESSION_ENTRIES` are enforced from *inside* the container, by writing past each and expecting an `ENOSPC` failure, and that the same byte limit stops a host-mediated write by `PUT`ting past it and expecting a `413`. Since the API keeps no byte accounting of its own, that `413` is the quota rejecting the write - the check is the only thing covering that path. All three are only meaningful once `SESSION_QUOTA_MOUNTPOINT` is configured and working (see above), so they're opt-in; pass `--max-session-size`/`--max-session-entries` to match the server's configured values if they differ from the defaults.
+Each check is handed its own freshly created session and its own is deleted afterwards, so checks neither depend on nor disturb one another and any one of them can be run alone.
+
+### Always-on groups
+
+| Group | What it covers |
+|---|---|
+| `core` | Session and file lifecycle, `PUT`/`GET`/`DELETE` including nested parents, directories, symlinks and zero-byte bodies, directory listings, sub_path containment, and that an interrupted `PUT` leaves the original file intact with no staging debris |
+| `languages` | All nine languages: module styles for `javascript`, type syntax for `typescript` (and that it is CommonJS, so top-level `await` fails), and for each compiled language a hello world, a compile error with diagnostics, and the requirement that nothing is left in the session directory |
+| `sandbox` | Read-only root filesystem, symlink containment, `RLIMIT_NOFILE`, and (heavy) that `MAX_MEMORY` kills rather than hangs, `CONTAINER_PIDS_LIMIT` bounds process creation without breaking the session, and `MAX_OUTPUT_SIZE` truncates without failing the run |
+| `results` | Change detection including cases a naive `(size, mtime)` stamp would miss, the `MAX_RESULT_ATTACHMENTS` cap and its `omitted_files`, that `deleted_files` is never truncated, that a non-UTF-8 filename is omitted rather than fatal, and that awkward filenames (quotes, newlines, spaces, non-ASCII, nested paths) survive `Content-Disposition` exactly |
+| `errors` | The documented status codes for malformed `/execute` and `/sessions` requests, and that a rejected request leaves neither attachments nor session slots behind |
+| `network` | That the sandbox has the outbound access `CONTAINER_NETWORK` intends, and that executed code **cannot** reach the API that is running it |
+
+The `network` group needs outbound access from the container; skip it with `--skip network` where there is none.
+
+> `api_unreachable_from_sandbox` is worth reading the failure message of. The sandbox has a routable path back to the host, so a server bound beyond loopback is reachable from the code it executes - which can then exhaust `MAX_SESSIONS` and start further executions of its own, sidestepping the per-container limits. It cannot read other callers' files: session ids are not discoverable from inside. `HOST` defaults to `127.0.0.1` so this passes out of the box; if you bind wider, isolate `CONTAINER_NETWORK` instead. See [Hardening](#hardening).
+
+### Opt-in groups
+
+Each needs the server configured differently from production defaults, so each has its own flag and is skipped (loudly, with its requirement) otherwise. Start a second server with the tuned environment on its own port and point the harness at it. The value flags exist because nothing tells the harness what the server is configured to; if they disagree, the assertion messages say so.
+
+| Flag | Server configuration | Harness flags |
+|---|---|---|
+| `--check-timeout` | `EXECUTION_TIMEOUT=8` | `--execution-timeout 8` |
+| `--check-capacity` | `MAX_SESSIONS=4 MAX_CONCURRENT_EXECUTIONS=2` | `--max-sessions 4 --max-concurrent-executions 2` |
+| `--check-lock` | `SESSION_LOCK_WAIT_TIMEOUT_SECONDS=2` | `--lock-wait-timeout 2` |
+| `--check-sweep` | `SESSION_INACTIVITY_TIMEOUT_SECONDS=5 SESSION_SWEEP_INTERVAL_SECONDS=2` | `--inactivity-timeout 5 --sweep-interval 2` |
+| `--check-fsize` | `CONTAINER_ULIMIT_FSIZE=1048576` | `--max-file-size 1048576` |
+| `--check-quota` | `SESSION_QUOTA_MOUNTPOINT` on an XFS `prjquota` mount | `--max-session-size` / `--max-session-entries` |
+| `--check-host` | none, but the harness must run on the API host | `--session-root <SESSION_ROOT_DIRECTORY>` |
+
+```cmd
+EXECUTION_TIMEOUT=8 SESSION_LOCK_WAIT_TIMEOUT_SECONDS=2 python app.py --no-session-quota --port 40010
+python harness.py --api-url http://127.0.0.1:40010 --only timeout lock --execution-timeout 8 --lock-wait-timeout 2
+```
+
+Naming a check or a group in `--only` enables its flag implicitly, so a single check can be run without also spelling out its gate. `--check-all` turns on every opt-in group, but no single server configuration satisfies all of them at once - `capacity` wants limits the other groups need headroom under, and `fsize` wants a per-file cap too small for `csharp` to build under - so it is for a purpose-built server, and it says so when used.
+
+`--check-capacity` in particular should be run on its own. It works by saturating `MAX_SESSIONS`, and every other check creates a session of its own.
+
+`--check-host` shells out to `podman` and looks at `SESSION_ROOT_DIRECTORY` directly, because what it checks is not visible over HTTP: that no container outlives the request that started it, that throwaway sessions leave no directories behind, and that `DELETE` really removes a session's directory even when executed code left something awkward in it.
+
+### Running the quota checks on a development machine
+
+`--check-quota` needs a real XFS filesystem with project quotas enabled, which a loopback image provides without a spare disk:
+
+```bash
+apt install xfsprogs
+truncate -s 2G /var/tmp/code_executor_quota.img
+mkfs.xfs /var/tmp/code_executor_quota.img
+mkdir -p /var/lib/code_executor
+mount -o loop,prjquota /var/tmp/code_executor_quota.img /var/lib/code_executor
+mkdir -p /var/lib/code_executor/sessions
+chown "$SERVICE_USER" /var/lib/code_executor/sessions
+xfs_quota -x -c 'state' /var/lib/code_executor   # Project quota state: ON, Enforcement: ON
+```
+
+Then start the server with `SESSION_ROOT_DIRECTORY=/var/lib/code_executor/sessions` and `SESSION_QUOTA_MOUNTPOINT=/var/lib/code_executor`, and run `python harness.py --check-quota`. The mount does not survive a reboot, which is the point - it is a test fixture, not the deployment recipe in "Enforcing `MAX_SESSION_SIZE` with an XFS project quota" above.
 
 ## Project Layout
 

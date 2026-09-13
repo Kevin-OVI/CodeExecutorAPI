@@ -13,6 +13,7 @@ from contextlib import suppress
 from typing import Iterable, Iterator, NamedTuple
 
 from ..config import (
+    CONTAINER_NETWORK,
     CONTAINER_PIDS_LIMIT,
     CONTAINER_RELATIVE_NICENESS,
     CONTAINER_TMPFS_SIZE,
@@ -198,7 +199,7 @@ class ExecutionEnvironment:
                 # happens to share CONTAINER_USER_ID.
                 f"--userns=keep-id:uid={CONTAINER_USER_ID},gid={CONTAINER_USER_ID}",
                 "--ipc=none",
-                "--net=bridge",
+                f"--net={CONTAINER_NETWORK}",
                 "--tmpfs", f"/tmp:rw,nosuid,nodev,exec,size={CONTAINER_TMPFS_SIZE}",
                 "--interactive", "--tty", "--rm",
                 "--label", "code_executor_api.managed=true",

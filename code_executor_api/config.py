@@ -46,7 +46,7 @@ def _read_int_env(name: str, default: int, *, min_value: int | None = None) -> i
     return value
 
 
-HOST = _read_str_env("HOST", "0.0.0.0")
+HOST = _read_str_env("HOST", "127.0.0.1")  # loopback by default: the API is unauthenticated, and the sandbox has a routable path back to the host, so binding wider is an explicit decision (see "Hardening" in the README)
 PORT = _read_int_env("PORT", 40003, min_value=1)
 
 EXECUTION_TIMEOUT = _read_int_env("EXECUTION_TIMEOUT", 20, min_value=1)  # seconds
@@ -65,6 +65,7 @@ CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_val
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 256 * 1024 * 1024, min_value=1)  # bytes
 CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)
 CONTAINER_TMPFS_SIZE = _read_str_env("CONTAINER_TMPFS_SIZE", "64m")
+CONTAINER_NETWORK = _read_str_env("CONTAINER_NETWORK", "bridge")  # podman network for executed code; point it at a dedicated network firewalled off the API's own port to keep outbound access while denying the sandbox a route back to the API (see "Hardening" in the README)
 PODMAN_IMAGE = _read_str_env("PODMAN_IMAGE", "code_executor")
 PODMAN_CHECK_TIMEOUT_SECONDS = _read_int_env("PODMAN_CHECK_TIMEOUT_SECONDS", 5, min_value=1)
 

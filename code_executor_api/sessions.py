@@ -156,6 +156,28 @@ def _entry_type(st_mode: int) -> str:
     return "other"
 
 
+def _remove_tree(path: str) -> None:
+    """Remove a session tree, restoring traversal on anything executed code locked down.
+
+    Executed code owns the files it creates, including their permission bits, so it can leave
+    behind a mode-000 directory the API cannot descend into - by accident as easily as on
+    purpose, since any build step that produces one does it. `os.fwalk` is top-down, so each
+    directory is made traversable before it is descended into.
+
+    Symlinks are skipped: chmod follows its final component, so following one would change the
+    mode of a path outside the session. The `dir_fd` form keeps that structural rather than
+    relying on the caller's lock to rule out a swapped parent.
+    """
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o700)
+    for _, directory_names, _, directory_fd in os.fwalk(path):
+        for name in directory_names:
+            with contextlib.suppress(OSError):
+                if stat.S_ISDIR(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
+                    os.chmod(name, 0o700, dir_fd=directory_fd)
+    shutil.rmtree(path)
+
+
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
     try:
         await asyncio.wait_for(lock.acquire(), timeout=sys.float_info.min)
@@ -203,7 +225,12 @@ class Session:
             try:
                 fd = os.open(filename, flags, dir_fd=parent_fd)
             except OSError as exc:
-                if exc.errno == errno.ELOOP:
+                # None of these have content to serve: a looping or dangling symlink (ELOOP), a
+                # device node with no driver behind it (ENODEV), or a socket, which cannot be
+                # opened at all (ENXIO). The caller asked for file content and there is none,
+                # which is the same not-found an absent file gets. Errnos that mean the *server*
+                # is in trouble (EMFILE, ENOMEM) deliberately stay a 500.
+                if exc.errno in (errno.ELOOP, errno.ENXIO, errno.ENODEV, errno.ENOTDIR):
                     raise FileNotFoundError(normalised_sub_path) from None
                 raise
             try:
@@ -294,10 +321,14 @@ class Session:
         normalised_sub_path, temporary_name = await self.stage_file(sub_path, content)
         try:
             await self.commit_staged_file(normalised_sub_path, temporary_name)
-        except OSError as exc:
+        except BaseException as exc:
+            # Catch everything, not just OSError: whatever goes wrong, the staged file must not
+            # survive the failed write. A narrower clause has already leaked one once (os.replace
+            # raises ValueError, not OSError, on a NUL in the path), and it would also miss a
+            # CancelledError arriving mid-commit.
             with contextlib.suppress(OSError):
                 await self.discard_staged_file(normalised_sub_path, temporary_name)
-            if exc.errno == errno.ENOSPC or exc.errno == errno.EDQUOT:
+            if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
                 raise SessionResourceLimitReached("Session storage or file count limit reached") from None
             raise
 
@@ -359,14 +390,26 @@ class SessionManager:
         except BaseException:
             self._sessions.pop(session_id, None)
             self._release_project_id(project_id)
-            await asyncio.to_thread(shutil.rmtree, work_directory, ignore_errors=True)
+            # Best-effort: this is a fresh mkdtemp that no code has run against yet, so there is
+            # nothing here for _remove_tree to unlock, and the original failure is the one to raise.
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(_remove_tree, work_directory)
             raise
         return session
 
     async def _delete(self, session: Session) -> None:
-        await asyncio.to_thread(shutil.rmtree, session.work_directory, ignore_errors=True)
-        self._release_project_id(session.project_id)
-        self._sessions.pop(session.id)
+        try:
+            await asyncio.to_thread(_remove_tree, session.work_directory)
+        except OSError:
+            # Hold the project id back rather than hand a successor an allowance that is already
+            # partly spent: the usage is still on disk, and _verify_quota_hard_limit only checks
+            # that a hard limit exists, never that usage is zero.
+            LOGGER.exception("Failed to remove session directory %s", session.work_directory)
+        else:
+            self._release_project_id(session.project_id)
+        finally:
+            # Both the sweep and delete_all iterate a snapshot, so the session may already be gone.
+            self._sessions.pop(session.id, None)
 
     async def delete(self, session_id: str) -> None:
         async with self.locked(session_id) as session:
@@ -445,4 +488,9 @@ class SessionManager:
 
     async def delete_all(self) -> None:
         for session in list(self._sessions.values()):
-            await self._delete(session)
+            # Keep going: this runs at shutdown, so one failing session must not abandon the
+            # rest and leak their directories.
+            try:
+                await self._delete(session)
+            except Exception:
+                LOGGER.exception("Failed to delete session %s during shutdown", session.id)
