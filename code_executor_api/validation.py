@@ -4,7 +4,7 @@ import posixpath
 from aiohttp import hdrs
 from aiohttp.web import HTTPBadRequest
 
-SUPPORTED_LANGUAGES = frozenset(("python", "bash", "javascript", "typescript", "c", "cpp", "java", "csharp", "rust"))
+from .languages import LANGUAGES
 
 
 class ValidationError(HTTPBadRequest):
@@ -38,7 +38,7 @@ def normalize_sub_path(filename: str) -> str:
 def validate_language(language: str | None):
     if language is None:
         raise ValidationError("Missing 'language' field")
-    if language not in SUPPORTED_LANGUAGES:
+    if language not in LANGUAGES.keys():
         raise ValidationError(f"Language {language} is unsupported")
 
 

@@ -4,7 +4,7 @@ Code Executor API runs untrusted code inside hardened, ephemeral Podman containe
 
 Linux only: the sandbox depends on rootless Podman, and the per-session limits on XFS project quotas.
 
-[Requirements](#requirements) · [Setup](#setup) · [Run API](#run-api) · [Configuration](#configuration) · [API](#api) · [Local Harness](#local-harness) · [Hardening](#hardening) · [Project Layout](#project-layout) · [Dependencies](#dependencies)
+[Requirements](#requirements) · [Sandbox images](#sandbox-images) · [Setup](#setup) · [Run API](#run-api) · [Configuration](#configuration) · [API](#api) · [Local Harness](#local-harness) · [Hardening](#hardening) · [Project Layout](#project-layout) · [Dependencies](#dependencies)
 
 ## Features
 
@@ -19,19 +19,14 @@ Linux only: the sandbox depends on rootless Podman, and the per-session limits o
 
 - Python 3.12+
 - Podman (the `podman` CLI must be on the API process's `PATH`)
-- The sandbox image must be built before starting the API, using `Containerfile`, then warmed once
-  **as the user that runs the API**
+- The [sandbox images](#sandbox-images) must be built before starting the API, then warmed once, both **as the user that runs the API** - `executor_images/build.sh` does the two in one go, building every image in parallel
   ```bash
-  podman build -t code_executor executor_image
-  podman run --rm --userns=keep-id:uid=4000,gid=4000 code_executor true
+  executor_images/build.sh            # every environment
+  executor_images/build.sh rust gcc   # only these (the base images are always rebuilt, which is a cache hit if unchanged)
   ```
-  The warm-up matters. Because `--userns=keep-id` asks for a uid mapping that differs from the
-  storage's default one, Podman has to re-chown the image the first time it is used that way
-  (`storage-chown-by-maps`). For this image that is several GiB of I/O and minutes of wall clock -
-  far longer than `EXECUTION_TIMEOUT`, so without the warm-up the first real execution just times
-  out. The result is cached per (image, mapping), so every later run starts in well under a second;
-  redo it after each rebuild. It also costs roughly the image's own size again on disk, since the
-  original layers are kept alongside the remapped ones.
+  The warm-up matters. Because `--userns=keep-id` asks for a uid mapping that differs from the storage's default one, Podman has to re-chown an image the first time it is used that way (`storage-chown-by-maps`). For the larger toolchains that is GiBs of I/O and minutes of wall clock - far longer than `EXECUTION_TIMEOUT`, so without the warm-up the first real execution in that language just times out. The result is cached per (image, mapping), so every later run starts in well under a second; the script redoes it after each rebuild, as `podman run --rm --userns=keep-id:uid=4000,gid=4000 <image> true`. It also costs roughly the image's own size again on disk, since the original layers are kept alongside the remapped ones.
+
+  The API runs with `--pull=never`, so an image that was never built fails its executions straight away instead of sending Podman to look for the name in a registry.
 
   Building as root does not avoid this: the chown happens in the *service account's* container
   storage, keyed to the mapping it asks for, so an image built or pulled by another user still pays
@@ -43,20 +38,29 @@ The API shells out to `podman run` as the user running the service, so that user
 Podman setup (rootful, or rootless with lingering enabled if the service is not started from a
 login session). Two rootless-specific notes:
 
-- Session working directories are bind-mounted into the container, and the executor passes
-  `--userns=keep-id:uid=<CONTAINER_USER_ID>,gid=<CONTAINER_USER_ID>` so the image's `appuser` maps
-  onto the host service account. That gives session files a single owner on both sides of the mount:
-  without it the two uids differ under rootless Podman and neither side can fully manage the other's
-  files (the API cannot read back or clean up what executed code created, and uploads are not
-  writable from inside the container). The id is pinned to `4000` in both the `Containerfile` and
-  `CONTAINER_USER_ID`; keep them in sync. It is deliberately not `1000`, so that if the user
-  namespace is ever lost the container's uid does not land on a real host account.
+- Session working directories are bind-mounted into the container, and the executor passes `--userns=keep-id:uid=<CONTAINER_USER_ID>,gid=<CONTAINER_USER_ID>` so the image's `appuser` maps onto the host service account. That gives session files a single owner on both sides of the mount: without it the two uids differ under rootless Podman and neither side can fully manage the other's files (the API cannot read back or clean up what executed code created, and uploads are not writable from inside the container). The code runs as `appuser` because the executor also passes `--user=<CONTAINER_USER_ID>:<CONTAINER_USER_ID>` - the images set no `USER`, so they build as root throughout. The id is pinned to `4000` in both `executor_images/base/Containerfile` and `CONTAINER_USER_ID`; keep them in sync. It is deliberately not `1000`, so that if the user namespace is ever lost the container's uid does not land on a real host account.
 - Rootless additionally requires `/etc/subuid` and `/etc/subgid` ranges for the service account that
   are **wider than `CONTAINER_USER_ID`**, since Podman maps container ids below it into that range
   before mapping `CONTAINER_USER_ID` itself to the host user. The conventional 65536-wide allocation
   is ample; a hand-trimmed range is not.
 - On SELinux-enforcing hosts, bind mounts need a relabel: append `:Z` to the `--volume` argument in
   `code_executor_api/executor/podman_executor.py`.
+
+## Sandbox images
+
+Each environment has its own image, so a language only ever runs next to its own toolchain. They are tagged `<PODMAN_IMAGE_PREFIX>-<environment>`, and `code_executor_api/languages.py` decides which one each language runs in:
+
+| Environment | Built from | Adds | Languages |
+|---|---|---|---|
+| `bash` | `base/` on `python:3.14.7-slim-trixie` | the shared setup, on top of Python | bash |
+| `python` | `python/` on `<prefix>-bash` | the pip packages | python |
+| `node` | `node/` on `<prefix>-base` | Node.js 26, `tsx` | javascript, typescript |
+| `gcc` | `gcc/` on `<prefix>-base` | `gcc`, `g++` | c, cpp |
+| `java` | `java/` on `<prefix>-base` | OpenJDK 25 | java |
+| `dotnet` | `dotnet/` on `<prefix>-base` | .NET SDK 10 | csharp |
+| `rust` | `rust/` on `<prefix>-base` | the minimal rustup profile, plus `gcc` as rustc's linker | rust |
+
+`<prefix>-base` is `base/` on `debian:trixie`: the shared setup with nothing else, which no language runs in directly. The shared setup itself - the utilities (`curl`, `git`, `ping`, `dig`, `nmap`, ...) and the pinned `appuser` - lives only in `base/Containerfile`, which `build.sh` builds twice with a different `FROM_IMAGE`. Every other image takes its parent as the `BASE_IMAGE` build argument. Adding a language to an existing environment only takes an entry in `languages.py`; a new environment also needs a directory under `executor_images/` and an entry in `build.sh`'s `environments` list.
 
 ## Setup
 
@@ -105,13 +109,13 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `MAX_SESSIONS` | `64` | |
 | `MAX_CONCURRENT_EXECUTIONS` | `4` | |
 | `CONTAINER_PIDS_LIMIT` | `128` | |
-| `CONTAINER_USER_ID` | `4000` | uid *and* gid of `appuser` inside `PODMAN_IMAGE`; must match the `Containerfile` |
+| `CONTAINER_USER_ID` | `4000` | uid *and* gid of `appuser` inside every sandbox image; must match `executor_images/base/Containerfile` |
 | `CONTAINER_ULIMIT_NOFILE` | `1024` | |
 | `CONTAINER_ULIMIT_FSIZE` | `268435456` | Bytes, per individual file |
 | `CONTAINER_RELATIVE_NICENESS` | `5` | Added to the API process's own niceness |
 | `CONTAINER_TMPFS_SIZE` | `64m` | Size of the container's `/tmp` |
 | `CONTAINER_NETWORK` | `bridge` | Podman network for executed code. The default reaches the host - see [Hardening](#hardening). Must be one that gets its own namespace: `host` makes `podman run` fail outright, because the container is also given `--sysctl net.ipv4.ping_group_range` (see [`ping` needs no capability](#ping-needs-no-capability)) |
-| `PODMAN_IMAGE` | `code_executor` | |
+| `PODMAN_IMAGE_PREFIX` | `code_executor` | Each language runs in `<prefix>-<environment>` (see [Sandbox images](#sandbox-images)); must match the prefix `executor_images/build.sh` was run with |
 | `PODMAN_CHECK_TIMEOUT_SECONDS` | `5` | |
 | `SESSION_INACTIVITY_TIMEOUT_SECONDS` | `1800` | Seconds before an idle session is deleted |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `60` | Seconds between expiry sweeps |
@@ -120,7 +124,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `SESSION_QUOTA_MOUNTPOINT` | unset | XFS mount point containing `SESSION_ROOT_DIRECTORY`. Unset leaves both session limits unenforced, which the server refuses to start under without `--no-session-quota` - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
 | `SESSION_QUOTA_COMMAND` | `xfs_quota` | argv prefix for `xfs_quota`, split like a shell command line but exec'd directly. Set it to `sudo -n /usr/sbin/xfs_quota` to delegate `CAP_SYS_ADMIN` without running the API as root - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
 
-Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE` via its own environment.
+Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE_PREFIX` via its own environment, with the images built under that prefix (`PODMAN_IMAGE_PREFIX=code_executor_test executor_images/build.sh`).
 
 ## API
 
@@ -323,7 +327,7 @@ Then point the API at it:
 export CONTAINER_NETWORK=code_executor_sandbox
 ```
 
-This blocks only the API's port. The image's tooling (`requests`, `yt-dlp`, `dnsutils`) keeps its outbound access, which the harness's `outbound_network` check asserts.
+This blocks only the API's port. The images' tooling (`dnsutils` everywhere, `requests` and `yt-dlp` in the python image) keeps its outbound access, which the harness's `outbound_network` check asserts.
 
 Verify both with the harness - `api_unreachable_from_sandbox` probes the host aliases on the API's own port from inside a container:
 
@@ -349,7 +353,7 @@ That message points at the wrong fix. iputils' `ping` opens an ICMP *datagram* s
 
 `--cap-add=NET_RAW` would also make `ping` work, which is what makes this worth writing down. Podman adds capabilities as **ambient** ones, so the grant is not scoped to `/bin/ping`: every process the executed code spawns holds `CAP_NET_RAW` effective, and with it `AF_PACKET` sockets. That is packet capture, ARP poisoning and source-address spoofing on a bridge shared with up to `MAX_CONCURRENT_EXECUTIONS` other sessions - so it would break the cross-session isolation claimed above, which rests on session ids being unguessable rather than on anything at the network layer. It would also make the nftables rule above (which matches on `ip saddr`) stop being a boundary, since forged frames can carry a source outside the sandbox subnet.
 
-Note that `--security-opt=no-new-privileges` rules out the other obvious route as well: with `NO_NEW_PRIVS` set the kernel ignores file capabilities on `execve`, so `setcap cap_net_raw+ep /bin/ping` in the `Containerfile` would not work either.
+Note that `--security-opt=no-new-privileges` rules out the other obvious route as well: with `NO_NEW_PRIVS` set the kernel ignores file capabilities on `execve`, so `setcap cap_net_raw+ep /bin/ping` in `executor_images/base/Containerfile` would not work either.
 
 The `ping_without_net_raw` check asserts both halves - that `ping` works *and* that every capability set is still empty - because either one alone passes under the wrong fix:
 
@@ -357,7 +361,7 @@ The `ping_without_net_raw` check asserts both halves - that `ping` works *and* t
 python harness.py --only ping_without_net_raw
 ```
 
-Utilities that genuinely do stay unavailable under `--cap-drop=ALL`: `nmap`'s privileged scan types (`-sS`, `-sU`, `-O`, `--traceroute`; note that `--cap-add` would not help, as nmap gates those on `geteuid() == 0` rather than on capabilities - `-sT`, its non-root default, works), binding ports below 1024, `chown` to another uid, `mount`, `dmesg`, and raising ulimits. Everything else the image ships - `dig`, `netstat`, `arp`, `telnet`, `git`, `curl`, `wget` and the Python stack - is unaffected.
+Utilities that genuinely do stay unavailable under `--cap-drop=ALL`: `nmap`'s privileged scan types (`-sS`, `-sU`, `-O`, `--traceroute`; note that `--cap-add` would not help, as nmap gates those on `geteuid() == 0` rather than on capabilities - `-sT`, its non-root default, works), binding ports below 1024, `chown` to another uid, `mount`, `dmesg`, and raising ulimits. Everything else the images ship - `dig`, `netstat`, `arp`, `telnet`, `git`, `curl`, `wget`, the toolchains and the Python stack - is unaffected.
 
 ### Enforcing `MAX_SESSION_SIZE` with an XFS project quota
 
@@ -424,12 +428,13 @@ Both hard limits are verified after they are set, because `limit` can exit 0 wit
 - `harness.py` - acceptance harness: drives a running server over HTTP (see [Local Harness](#local-harness))
 - `code_executor_api/app_factory.py` - app wiring, startup, and cleanup hooks
 - `code_executor_api/config.py` - environment-backed constants
+- `code_executor_api/languages.py` - the supported languages: which image each runs in, and with which command
 - `code_executor_api/validation.py` - sub_path normalization, language/null-byte validation
 - `code_executor_api/file_helpers.py` - streaming reads/writes (bounded per file) shared by sessions and file uploads
 - `code_executor_api/sessions.py` - `Session`/`SessionManager`: locking, creation/deletion, expiry sweep, and (when `SESSION_QUOTA_MOUNTPOINT` is set) per-session XFS project quota setup
 - `code_executor_api/executor/podman_executor.py` - Podman container invocation and file-diffing
 - `code_executor_api/routes/` - `/sessions`, `/sessions/{id}/files/{path}`, `/execute` (and `/sessions/{id}/execute`), `/health` handlers
-- `executor_image/` - `Containerfile` and per-language `executors/*.sh` scripts for the sandbox image (Python, Bash, Node.js, GCC/G++, JDK, .NET SDK, Rust toolchain)
+- `executor_images/` - one directory per sandbox image, each with its `Containerfile` and, for the compiled languages, the `executors/*.sh` scripts that compile and run them; `build.sh` builds and warms them all (see [Sandbox images](#sandbox-images))
 
 ## Dependencies
 

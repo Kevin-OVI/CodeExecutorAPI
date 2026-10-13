@@ -1,0 +1,10 @@
+# Extends the bash image, which is the shared setup built on the official Python image.
+ARG BASE_IMAGE=code_executor-bash
+FROM ${BASE_IMAGE}
+
+RUN --mount=type=cache,target=/root/.cache/pip,id=pip,sharing=locked \
+  pip install -U pip && \
+  pip install -U aiohttp beautifulsoup4 bokeh boltons cryptography dateparser emoji \
+    faker fpdf graphviz humanize imageio loguru markdown matplotlib more-itertools \
+    networkx numpy pandas paho-mqtt pillow plotly pydub python-dateutil python-whois \
+    requests scipy seaborn sympy tabulate watchdog websockets yt-dlp

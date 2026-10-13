@@ -10,7 +10,7 @@ import stat
 import threading
 import time
 from contextlib import suppress
-from typing import Iterable, Iterator, NamedTuple
+from typing import Iterator, NamedTuple
 
 from ..config import (
     CONTAINER_NETWORK,
@@ -25,23 +25,12 @@ from ..config import (
     MAX_MEMORY,
     MAX_OUTPUT_SIZE,
     PODMAN_CHECK_TIMEOUT_SECONDS,
-    PODMAN_IMAGE,
+    PODMAN_IMAGE_PREFIX,
 )
+from ..languages import LANGUAGES
 from ..sessions import Session
 
 LOGGER = logging.getLogger(__name__)
-
-COMMANDS: dict[str, Iterable[str]] = {
-    "python": ("python", "-c"),
-    "bash": ("bash", "-c"),
-    "javascript": ("node", "--eval"),
-    "typescript": ("tsx", "--eval"),
-    "c": ("/executors/c.sh",),
-    "cpp": ("/executors/cpp.sh",),
-    "java": ("/executors/java.sh",),
-    "csharp": ("/executors/csharp.sh",),
-    "rust": ("/executors/rust.sh",),
-}
 
 
 class ExecutionResult(NamedTuple):
@@ -172,7 +161,7 @@ class ExecutionEnvironment:
     __slots__ = ("session", "language", "code", "container_name", "input_files")
 
     def __init__(self, session: Session, language: str, code: str):
-        if language not in COMMANDS:
+        if language not in LANGUAGES:
             raise ValueError(f"Unsupported language: {language}")
         self.session = session
         self.language = language
@@ -198,10 +187,14 @@ class ExecutionEnvironment:
         try:
             master_fd, slave_fd = pty.openpty()
             read_task = asyncio.create_task(asyncio.to_thread(read_max_and_close, master_fd, slave_fd, evt))
-            command = COMMANDS[self.language]
+            runtime = LANGUAGES[self.language]
             current_niceness = os.nice(0)
             process = await asyncio.create_subprocess_exec(
                 "podman", "run",
+                # The images only ever exist locally, built by executor_images/build.sh. Without
+                # this, a missing one makes podman go looking for its short name in a registry,
+                # which at best burns the timeout and at worst runs whatever it finds there.
+                "--pull=never",
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
@@ -216,6 +209,7 @@ class ExecutionEnvironment:
                 # the *same* id in the container, which only lines up if the service account
                 # happens to share CONTAINER_USER_ID.
                 f"--userns=keep-id:uid={CONTAINER_USER_ID},gid={CONTAINER_USER_ID}",
+                f"--user={CONTAINER_USER_ID}:{CONTAINER_USER_ID}",
                 "--ipc=none",
                 f"--net={CONTAINER_NETWORK}",
                 "--sysctl", f"net.ipv4.ping_group_range={CONTAINER_USER_ID} {CONTAINER_USER_ID}",
@@ -227,9 +221,9 @@ class ExecutionEnvironment:
                 f"--cpus={MAX_CPU_CORES}",
                 "--volume", f"{self.session.work_directory}:/app/",
                 "--name", self.container_name,
-                PODMAN_IMAGE,
+                f"{PODMAN_IMAGE_PREFIX}-{runtime.image}",
                 "nice", "-n", str(current_niceness + CONTAINER_RELATIVE_NICENESS),
-                *command, self.code,
+                *runtime.command, self.code,
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                 # conmon records a cgroup OOM kill by creating an empty marker file named `oom`
                 # in its working directory, which it inherits from podman, which inherits it from

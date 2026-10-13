@@ -1,0 +1,30 @@
+# The setup every sandbox image shares. `build.sh` builds it twice: on plain Debian as the base
+# the toolchain images start from, and on the official Python image as the bash image, which the
+# python image then extends - so the shared setup lives in this one file either way.
+ARG FROM_IMAGE=docker.io/library/debian:trixie
+FROM ${FROM_IMAGE}
+
+# `docker-clean` is the literal name of the apt config shipped by the base image; dropping it
+# (and keeping downloaded packages) is what makes the apt cache mounts below effective.
+RUN rm -f /etc/apt/apt.conf.d/docker-clean && \
+  echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \
+  apt update && apt upgrade -y && \
+  apt install -y ca-certificates cmatrix cowsay curl dnsutils fortune git gnupg iputils-ping \
+    lolcat lsb-release man net-tools nmap telnet tree wget
+
+ENV PATH="/usr/games:${PATH}"
+
+# The id is pinned because `podman run --userns=keep-id:uid=...,gid=...` maps the host service
+# account onto it (see CONTAINER_USER_ID in code_executor_api/config.py); an unpinned `useradd`
+# would take whatever is free. 4000 rather than the default 1000 so that if the user namespace is
+# ever lost, the container's uid does not land on a real host account.
+#
+# There is deliberately no `USER appuser`: the API selects the user with `podman run --user`, so
+# every image builds as root throughout instead of switching back to root to install anything.
+RUN groupadd -g 4000 appuser && \
+  useradd -u 4000 -g 4000 appuser -ms /sbin/nologin -d /app
+
+WORKDIR /app

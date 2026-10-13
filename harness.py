@@ -1514,9 +1514,9 @@ async def check_output_truncation(session: aiohttp.ClientSession, api_url: str, 
 async def check_outbound_network(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
     """Executed code has outbound network access, which the sandbox grants deliberately.
 
-    The image ships requests, yt-dlp, dnsutils and ping, so this is a feature rather than an
-    oversight - and a silent regression to --net=none would break those without failing any
-    other check.
+    The images ship dnsutils and ping, and the python one requests and yt-dlp, so this is a
+    feature rather than an oversight - and a silent regression to --net=none would break those
+    without failing any other check.
     """
     result = await _execute(
         session, api_url, "python",

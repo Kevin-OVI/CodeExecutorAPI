@@ -81,13 +81,13 @@ MAX_RESULT_ATTACHMENTS = _read_int_env("MAX_RESULT_ATTACHMENTS", 256, min_value=
 MAX_SESSIONS = _read_int_env("MAX_SESSIONS", 64, min_value=1)
 MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_value=1)
 CONTAINER_PIDS_LIMIT = _read_int_env("CONTAINER_PIDS_LIMIT", 128, min_value=1)
-CONTAINER_USER_ID = _read_int_env("CONTAINER_USER_ID", 4000, min_value=1)  # uid *and* gid of `appuser` in PODMAN_IMAGE; must match the Containerfile, since `--userns=keep-id` maps the host service account onto it
+CONTAINER_USER_ID = _read_int_env("CONTAINER_USER_ID", 4000, min_value=1)  # uid *and* gid of `appuser` in every sandbox image; must match executor_images/base/Containerfile, since `--userns=keep-id` maps the host service account onto it
 CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_value=1)
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 256 * 1024 * 1024, min_value=1)  # bytes
 CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)
 CONTAINER_TMPFS_SIZE = _read_str_env("CONTAINER_TMPFS_SIZE", "64m")
 CONTAINER_NETWORK = _read_str_env("CONTAINER_NETWORK", "bridge")  # podman network for executed code; point it at a dedicated network firewalled off the API's own port to keep outbound access while denying the sandbox a route back to the API (see "Hardening" in the README)
-PODMAN_IMAGE = _read_str_env("PODMAN_IMAGE", "code_executor")
+PODMAN_IMAGE_PREFIX = _read_str_env("PODMAN_IMAGE_PREFIX", "code_executor")  # each language runs in f"{prefix}-{image}" (see languages.py); must match the prefix executor_images/build.sh tagged with
 PODMAN_CHECK_TIMEOUT_SECONDS = _read_int_env("PODMAN_CHECK_TIMEOUT_SECONDS", 5, min_value=1)
 
 SESSION_INACTIVITY_TIMEOUT_SECONDS = _read_int_env("SESSION_INACTIVITY_TIMEOUT_SECONDS", 1800, min_value=1)

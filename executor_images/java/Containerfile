@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=code_executor-base
+FROM ${BASE_IMAGE}
+
+RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \
+  apt update && \
+  apt install -y openjdk-25-jdk-headless
+
+COPY executors/* /executors/
+RUN chmod +x /executors/*.sh

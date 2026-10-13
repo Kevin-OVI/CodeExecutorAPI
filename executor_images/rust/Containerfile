@@ -1,0 +1,19 @@
+ARG BASE_IMAGE=code_executor-base
+FROM ${BASE_IMAGE}
+
+# rustc links through `cc`, so the C toolchain is a dependency here and not just the gcc image's.
+RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt/lists,id=apt-lists,sharing=locked \
+  apt update && \
+  apt install -y gcc libc6-dev
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+  CARGO_HOME=/usr/local/cargo
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
+  chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
+
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+COPY executors/* /executors/
+RUN chmod +x /executors/*.sh
