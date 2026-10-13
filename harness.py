@@ -1975,6 +1975,25 @@ async def check_no_leaked_containers(session: aiohttp.ClientSession, api_url: st
     )
     print("No containers left behind (as expected)")
 
+    # A busy loop that ignores SIGTERM - as the container's PID 1, any program without a
+    # handler does - is what a graceful stop fails to end.
+    result = await _execute(session, api_url, "bash", "while :; do :; done", session_id=session_id)
+    assert result["timed_out"] is True, (
+        f"A never-ending loop was not marked timed out: {result!r} -- the server's "
+        "EXECUTION_TIMEOUT may be far above --execution-timeout"
+    )
+
+    await asyncio.sleep(2)
+    after = _podman_managed_containers()
+    leaked = [line for line in after if line not in before]
+    print(f"Managed containers after a timed-out loop: {after or 'none'}")
+    assert not leaked, (
+        f"A timed-out busy loop outlived its request: {leaked} -- the program is PID 1 and "
+        "ignores SIGTERM, so the cleanup has to SIGKILL it (`podman rm --force --time 0`) rather "
+        "than wait out podman's stop grace period, which outlasts PODMAN_CHECK_TIMEOUT_SECONDS"
+    )
+    print("A timed-out busy loop left no container behind (as expected)")
+
 
 async def check_session_directory_removed(session: aiohttp.ClientSession, api_url: str, cfg: Config) -> None:
     """Deleting a session removes its directory from disk, whatever executed code left there.
@@ -2209,8 +2228,8 @@ CHECKS: tuple[Check, ...] = (
     Check("quota_survives_project_id_reuse", check_quota_survives_project_id_reuse,
           group="quota", sessions=0, heavy=True, timeout=300.0,
           summary="a session reusing a freed XFS project id still gets its full quota"),
-    Check("no_leaked_containers", check_no_leaked_containers, group="host",
-          summary="no container outlives the request that started it"),
+    Check("no_leaked_containers", check_no_leaked_containers, group="host", timeout=300.0,
+          summary="no container outlives the request that started it, even a timed-out loop"),
     Check("session_directory_removed", check_session_directory_removed, group="host", sessions=0,
           summary="DELETE really removes the session directory, whatever code left in it"),
     Check("no_orphan_session_directories", check_no_orphan_session_directories, group="host", sessions=0,

@@ -146,7 +146,7 @@ def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event,
 async def _remove_container(container_name: str) -> bool:
     try:
         process = await asyncio.create_subprocess_exec(
-            "podman", "rm", "--force", container_name,
+            "podman", "rm", "--force", "--time", "0", container_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
