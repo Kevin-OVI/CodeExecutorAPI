@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 prefix="${PODMAN_IMAGE_PREFIX:-code_executor}"
 uid="${CONTAINER_USER_ID:-4000}"
-python_image="docker.io/library/python:3.14.7-slim-trixie"
+python_image="docker.io/library/python:3.15.0-trixie"
 
 # Every image the API runs, by the suffix `code_executor_api/languages.py` gives it. `bash` is
 # base/ built on top of $python_image; each other one is the directory of the same name.

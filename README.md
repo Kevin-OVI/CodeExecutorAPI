@@ -52,7 +52,7 @@ Each environment has its own image, so a language only ever runs next to its own
 
 | Environment | Built from | Adds | Languages |
 |---|---|---|---|
-| `bash` | `base/` on `python:3.14.7-slim-trixie` | the shared setup, on top of Python | bash |
+| `bash` | `base/` on `python:3.15.0-trixie` | the shared setup, on top of Python | bash |
 | `python` | `python/` on `<prefix>-bash` | the pip packages | python |
 | `node` | `node/` on `<prefix>-base` | Node.js 26, `tsx` | javascript, typescript |
 | `gcc` | `gcc/` on `<prefix>-base` | `gcc`, `g++` | c, cpp |
