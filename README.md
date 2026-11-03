@@ -335,6 +335,12 @@ Verify both with the harness - `api_unreachable_from_sandbox` probes the host al
 python harness.py --only api_unreachable_from_sandbox outbound_network
 ```
 
+### Execution output stays out of the journal
+
+On a systemd host, Podman's default `log_driver` is `journald`: conmon copies everything a container writes to stdout and stderr into the host journal. Here that output is produced by user-submitted code, so it would let any caller of `/execute` write arbitrary content into `journalctl` - forged log lines, terminal escape sequences, or enough volume to rotate genuine entries out.
+
+`podman_executor.py` therefore passes `--log-driver=none`. Nothing depends on container logs: the output is read back over the pty the container is attached to, and `--rm` leaves nothing for `podman logs` to read. Because the flag is on the command line, it also wins over any `log_driver` set in the service account's `containers.conf`. Do not remove it.
+
 ### `ping` needs no capability
 
 Containers run with `--cap-drop=ALL`, and `ping` is the one shipped utility that looks like a casualty of it. Its own error message says so:

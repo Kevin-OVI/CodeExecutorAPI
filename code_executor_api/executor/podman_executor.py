@@ -215,6 +215,12 @@ class ExecutionEnvironment:
                 "--sysctl", f"net.ipv4.ping_group_range={CONTAINER_USER_ID} {CONTAINER_USER_ID}",
                 "--tmpfs", f"/tmp:rw,nosuid,nodev,exec,size={CONTAINER_TMPFS_SIZE}",
                 "--interactive", "--tty", "--rm",
+                # On a systemd host Podman's default log driver is journald, so conmon would copy
+                # everything the executed code prints - entirely user-controlled - into the host
+                # journal. Nothing here reads container logs: output comes back over the pty, and
+                # `--rm` leaves nothing for `podman logs` anyway. Passing it here also overrides
+                # any `log_driver` set in the service account's containers.conf.
+                "--log-driver=none",
                 "--label", "code_executor_api.managed=true",
                 f"--memory={MAX_MEMORY}",
                 f"--memory-swap={MAX_MEMORY}",
