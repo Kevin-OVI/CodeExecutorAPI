@@ -88,7 +88,7 @@ class Config:
         "env": "MAX_CONCURRENT_EXECUTIONS", "help": "sizes the concurrency probe"})
     lock_wait_timeout: int = dataclasses.field(default=30, metadata={
         "env": "SESSION_LOCK_WAIT_TIMEOUT_SECONDS", "help": "seconds; how long a 409 should take"})
-    inactivity_timeout: int = dataclasses.field(default=1800, metadata={
+    inactivity_timeout: int = dataclasses.field(default=7200, metadata={
         "env": "SESSION_INACTIVITY_TIMEOUT_SECONDS", "help": "seconds; how long expiry takes"})
     sweep_interval: int = dataclasses.field(default=60, metadata={
         "env": "SESSION_SWEEP_INTERVAL_SECONDS", "help": "seconds; added to the expiry wait"})

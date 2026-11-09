@@ -117,7 +117,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `CONTAINER_NETWORK` | `bridge` | Podman network for executed code. The default reaches the host - see [Hardening](#hardening). Must be one that gets its own namespace: `host` makes `podman run` fail outright, because the container is also given `--sysctl net.ipv4.ping_group_range` (see [`ping` needs no capability](#ping-needs-no-capability)) |
 | `PODMAN_IMAGE_PREFIX` | `code_executor` | Each language runs in `<prefix>-<environment>` (see [Sandbox images](#sandbox-images)); must match the prefix `executor_images/build.sh` was run with |
 | `PODMAN_CHECK_TIMEOUT_SECONDS` | `5` | |
-| `SESSION_INACTIVITY_TIMEOUT_SECONDS` | `1800` | Seconds before an idle session is deleted |
+| `SESSION_INACTIVITY_TIMEOUT_SECONDS` | `7200` | Seconds before an idle session is deleted |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `60` | Seconds between expiry sweeps |
 | `SESSION_EVICTION_MIN_IDLE_SECONDS` | `300` | Seconds a session must have been idle before a new one can evict it at `MAX_SESSIONS`. Busy sessions are never evicted; when no session qualifies, creation returns `503`. `0` evicts any idle session; a value at or above `SESSION_INACTIVITY_TIMEOUT_SECONDS` only evicts expired sessions the sweep has not reached yet |
 | `SESSION_LOCK_WAIT_TIMEOUT_SECONDS` | `30` | Seconds a request waits for a session lock or an execution slot before returning `409`/`503` |
