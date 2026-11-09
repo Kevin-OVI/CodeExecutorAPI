@@ -42,11 +42,10 @@ async def handle_execute(request: web.Request) -> web.Response:
         return web.json_response({"error": "Request must be multipart/form-data"}, status=400)
 
     try:
-        if ephemeral:
-            session_id = (await session_manager.create()).id
-        assert session_id is not None
-
-        async with session_manager.locked(session_id) as session:
+        # An ephemeral session is held locked from creation, so a concurrent create() cannot
+        # evict it before it runs. It is deleted in the `finally` below either way.
+        async with (session_manager.create_locked() if ephemeral else session_manager.locked(session_id)) as session:
+            session_id = session.id
             language: str | None = None
             code: str | None = None
             staged: list[tuple[str, str]] = []

@@ -106,7 +106,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `MAX_SESSION_SIZE` | `104857600` | Bytes per session, enforced only by the XFS quota - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
 | `MAX_SESSION_ENTRIES` | `32768` | Inodes per session (files, directories and symlinks alike), enforced the same way. Keep it well clear of what a real workload installs - a scientific Python stack is roughly 15000 |
 | `MAX_RESULT_ATTACHMENTS` | `256` | Changed files returned as `/execute` parts; the rest are named in `omitted_files`, and execution is never failed over it |
-| `MAX_SESSIONS` | `64` | |
+| `MAX_SESSIONS` | `64` | Once reached, creating a session evicts the least-recently-used idle one - see `SESSION_EVICTION_MIN_IDLE_SECONDS` |
 | `MAX_CONCURRENT_EXECUTIONS` | `4` | |
 | `CONTAINER_PIDS_LIMIT` | `128` | |
 | `CONTAINER_USER_ID` | `4000` | uid *and* gid of `appuser` inside every sandbox image; must match `executor_images/base/Containerfile` |
@@ -119,6 +119,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `PODMAN_CHECK_TIMEOUT_SECONDS` | `5` | |
 | `SESSION_INACTIVITY_TIMEOUT_SECONDS` | `1800` | Seconds before an idle session is deleted |
 | `SESSION_SWEEP_INTERVAL_SECONDS` | `60` | Seconds between expiry sweeps |
+| `SESSION_EVICTION_MIN_IDLE_SECONDS` | `300` | Seconds a session must have been idle before a new one can evict it at `MAX_SESSIONS`. Busy sessions are never evicted; when no session qualifies, creation returns `503`. `0` evicts any idle session; a value at or above `SESSION_INACTIVITY_TIMEOUT_SECONDS` only evicts expired sessions the sweep has not reached yet |
 | `SESSION_LOCK_WAIT_TIMEOUT_SECONDS` | `30` | Seconds a request waits for a session lock or an execution slot before returning `409`/`503` |
 | `SESSION_ROOT_DIRECTORY` | system temp dir | Base directory for session working directories |
 | `SESSION_QUOTA_MOUNTPOINT` | unset | XFS mount point containing `SESSION_ROOT_DIRECTORY`. Unset leaves both session limits unenforced, which the server refuses to start under without `--no-session-quota` - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
@@ -209,7 +210,7 @@ Notes on what counts as changed:
 - Change detection compares `(inode, size, mtime, ctime)` rather than hashing contents, so rewriting a file with byte-identical content counts as a modification and comes back as an attachment.
 - Hidden directories are excluded at every depth. The session directory is also the container's `$HOME`, so `.cache`, `.local`, `.npm` and the like would otherwise flood the response with package-manager noise. They still occupy the session's byte and inode quotas, and are still visible through the files API.
 
-Error statuses: `400` invalid input (bad language, invalid path), `404` missing session, `409` session lock timeout, `413` request/session limit, `503` unavailable capacity, `500` unexpected error fallback (including a failure to apply the session's XFS quota, when `SESSION_QUOTA_MOUNTPOINT` is configured).
+Error statuses: `400` invalid input (bad language, invalid path), `404` missing session, `409` session lock timeout, `413` request/session limit, `503` unavailable capacity (for session creation: every session is busy or used within `SESSION_EVICTION_MIN_IDLE_SECONDS`, so none could be evicted), `500` unexpected error fallback (including a failure to apply the session's XFS quota, when `SESSION_QUOTA_MOUNTPOINT` is configured).
 
 ## Local Harness
 
@@ -248,7 +249,7 @@ Each needs the server configured differently from production defaults, so each h
 | Flag | Server configuration | Harness flags |
 |---|---|---|
 | `--check-timeout` | `EXECUTION_TIMEOUT=8` | `--execution-timeout 8` |
-| `--check-capacity` | `MAX_SESSIONS=4 MAX_CONCURRENT_EXECUTIONS=2` | `--max-sessions 4 --max-concurrent-executions 2` |
+| `--check-capacity` | `MAX_SESSIONS=4 MAX_CONCURRENT_EXECUTIONS=2 SESSION_EVICTION_MIN_IDLE_SECONDS=2` | `--max-sessions 4 --max-concurrent-executions 2 --eviction-min-idle 2` |
 | `--check-lock` | `SESSION_LOCK_WAIT_TIMEOUT_SECONDS=2` | `--lock-wait-timeout 2` |
 | `--check-sweep` | `SESSION_INACTIVITY_TIMEOUT_SECONDS=5 SESSION_SWEEP_INTERVAL_SECONDS=2` | `--inactivity-timeout 5 --sweep-interval 2` |
 | `--check-fsize` | `CONTAINER_ULIMIT_FSIZE=1048576` | `--max-file-size 1048576` |
@@ -293,7 +294,7 @@ This is not derivable from the flag list, and it is the assumption the per-conta
 
 What it allows, stated precisely:
 
-- **Denial of service.** `POST /sessions` until `MAX_SESSIONS` is exhausted, after which every legitimate caller gets `503`. Sessions expire after `SESSION_INACTIVITY_TIMEOUT_SECONDS`, so holding the condition just means re-creating them. `MAX_CONCURRENT_EXECUTIONS` can be saturated the same way. On disk that is `MAX_SESSIONS` × `MAX_SESSION_SIZE`, or unbounded when `SESSION_QUOTA_MOUNTPOINT` is unset.
+- **Denial of service and session eviction.** `POST /sessions` until `MAX_SESSIONS` is exhausted. From then on, each further creation evicts the least-recently-used session idle for at least `SESSION_EVICTION_MIN_IDLE_SECONDS`, so a flood deletes other callers' idle sessions along with their files, and they get `404` on their next request. Once every session is the flood's own and recent, or busy, legitimate callers get `503`, and re-creating sessions keeps it that way. `SESSION_EVICTION_MIN_IDLE_SECONDS` is the trade-off: raising it protects idle sessions longer, at the cost of more `503`s when the server is full of abandoned sessions. `MAX_CONCURRENT_EXECUTIONS` can be saturated the same way. On disk that is `MAX_SESSIONS` × `MAX_SESSION_SIZE`, or unbounded when `SESSION_QUOTA_MOUNTPOINT` is unset.
 - **Resource amplification**, as above.
 
 What it does **not** allow is cross-session data access. There is no enumeration endpoint - every session-scoped route carries `{session_id}` in its path and nothing lists sessions. Session ids are 128 bits from a CSPRNG, so they are neither brute-forceable nor predictable from an id the caller legitimately owns. The id never reaches the container either: the working directory is an independently random `mkdtemp` name, so although `/proc/self/mountinfo` exposes the host path of the bind mount, the name it reveals is unrelated to the session id, and nothing passes the id in as an environment variable or argument. Reading another caller's files requires an id obtained some other way - a client leaking one, not the API disclosing it.

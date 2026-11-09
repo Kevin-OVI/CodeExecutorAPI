@@ -92,6 +92,7 @@ PODMAN_CHECK_TIMEOUT_SECONDS = _read_int_env("PODMAN_CHECK_TIMEOUT_SECONDS", 5, 
 
 SESSION_INACTIVITY_TIMEOUT_SECONDS = _read_int_env("SESSION_INACTIVITY_TIMEOUT_SECONDS", 1800, min_value=1)
 SESSION_SWEEP_INTERVAL_SECONDS = _read_int_env("SESSION_SWEEP_INTERVAL_SECONDS", 60, min_value=1)
+SESSION_EVICTION_MIN_IDLE_SECONDS = _read_int_env("SESSION_EVICTION_MIN_IDLE_SECONDS", 300, min_value=0)  # at MAX_SESSIONS, creating a session evicts the least-recently-used idle one, but only once it has been idle this long; 0 evicts any idle session, and a value at or above SESSION_INACTIVITY_TIMEOUT_SECONDS limits eviction to expired sessions the sweep has not reached yet
 SESSION_LOCK_WAIT_TIMEOUT_SECONDS = _read_int_env("SESSION_LOCK_WAIT_TIMEOUT_SECONDS", 30, min_value=1)
 SESSION_ROOT_DIRECTORY = _read_optional_path_env("SESSION_ROOT_DIRECTORY")  # absolute: session directories are bind-mounted by podman, which does not share this process's working directory
 SESSION_QUOTA_MOUNTPOINT = _read_optional_str_env("SESSION_QUOTA_MOUNTPOINT")  # XFS mountpoint (containing SESSION_ROOT_DIRECTORY) to enforce MAX_SESSION_SIZE via a per-session XFS project quota; unset disables quota enforcement

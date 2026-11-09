@@ -92,6 +92,8 @@ class Config:
         "env": "SESSION_INACTIVITY_TIMEOUT_SECONDS", "help": "seconds; how long expiry takes"})
     sweep_interval: int = dataclasses.field(default=60, metadata={
         "env": "SESSION_SWEEP_INTERVAL_SECONDS", "help": "seconds; added to the expiry wait"})
+    eviction_min_idle: int = dataclasses.field(default=300, metadata={
+        "env": "SESSION_EVICTION_MIN_IDLE_SECONDS", "help": "seconds; how long the capacity probe waits for a session to become evictable"})
     session_root: str = dataclasses.field(default="", metadata={
         "env": "SESSION_ROOT_DIRECTORY",
         "help": "the server's session directory on this host, for the host-side checks"})
@@ -1702,38 +1704,91 @@ async def check_execution_timeout(session: aiohttp.ClientSession, api_url: str, 
 
 
 async def check_session_capacity(session: aiohttp.ClientSession, api_url: str, cfg: Config) -> None:
-    """At MAX_SESSIONS, creating another is refused with 503 and the API stays healthy.
+    """At MAX_SESSIONS, creating another evicts the least-recently-used idle session.
 
-    Capacity is reported, not enforced by queueing: a caller that gets 503 can retry or free a
-    session, which it can only do if the refusal left everything else working.
+    Only a session idle for at least SESSION_EVICTION_MIN_IDLE_SECONDS, and not busy, can be
+    evicted. While none qualifies, creation is refused with 503 and the API stays healthy: a
+    caller that gets 503 can retry or free a session, which it can only do if the refusal left
+    everything else working.
     """
     async with owned_sessions(session, api_url, cfg.max_sessions) as session_ids:
         print(f"Filled session capacity with {len(session_ids)} sessions")
 
+        async def assert_refused(reason: str) -> None:
+            async with session.post(f"{api_url}/sessions") as response:
+                status, body = response.status, (await response.text())[:160]
+            assert status == 503, (
+                f"Expected 503 creating a session past --max-sessions ({cfg.max_sessions}) while "
+                f"{reason}, got {status}: {body!r} -- the server's MAX_SESSIONS or "
+                "SESSION_EVICTION_MIN_IDLE_SECONDS may differ from --max-sessions/--eviction-min-idle"
+            )
+            print(f"POST /sessions at capacity while {reason} -> 503 {body!r} (as expected)")
+
+            # An ephemeral /execute needs a session of its own, so it is refused the same way
+            # rather than running without one.
+            data = aiohttp.FormData(default_to_multipart=True)
+            data.add_field("language", "bash")
+            data.add_field("code", "echo hi")
+            async with session.post(f"{api_url}/execute", data=data) as response:
+                status, body = response.status, (await response.text())[:160]
+            assert status == 503, (
+                f"Expected 503 for an ephemeral /execute at capacity while {reason}, got {status}: {body!r}"
+            )
+            print(f"POST /execute at capacity while {reason} -> 503 {body!r} (as expected)")
+
+        async def touch(session_id: str) -> int:
+            async with session.get(f"{api_url}/sessions/{session_id}/files/") as response:
+                return response.status
+
+        # 1. Every session was just created, so none is past the grace period yet.
+        await assert_refused("every session is within the eviction grace period")
+
+        # 2. Let them all age past the grace period, then use all but the oldest again: that
+        # one is the only candidate, and creating a session must evict exactly it.
+        await asyncio.sleep(cfg.eviction_min_idle + 1)
+        for session_id in session_ids[1:]:
+            assert await touch(session_id) == 200, f"Session {session_id} vanished before eviction"
         async with session.post(f"{api_url}/sessions") as response:
             status, body = response.status, (await response.text())[:160]
-        assert status == 503, (
-            f"Expected 503 creating a session past --max-sessions ({cfg.max_sessions}), got "
-            f"{status}: {body!r} -- the server's MAX_SESSIONS may differ from --max-sessions"
-        )
-        print(f"POST /sessions at capacity -> 503 {body!r} (as expected)")
+            assert status == 200, (
+                f"Expected a session past --max-sessions ({cfg.max_sessions}) to evict an idle one, "
+                f"got {status}: {body!r} -- the server's SESSION_EVICTION_MIN_IDLE_SECONDS may "
+                f"differ from --eviction-min-idle ({cfg.eviction_min_idle}s)"
+            )
+            session_ids.append((await response.json())["session_id"])
+        print("POST /sessions at capacity with an idle session -> 200 (as expected)")
 
-        # An ephemeral /execute needs a session of its own, so it is refused the same way
-        # rather than running without one.
-        data = aiohttp.FormData(default_to_multipart=True)
-        data.add_field("language", "bash")
-        data.add_field("code", "echo hi")
-        async with session.post(f"{api_url}/execute", data=data) as response:
-            status, body = response.status, (await response.text())[:160]
-        assert status == 503, (
-            f"Expected 503 for an ephemeral /execute at capacity, got {status}: {body!r}"
+        status = await touch(session_ids[0])
+        assert status == 404, (
+            f"Expected the least-recently-used session to have been evicted (404), got {status}"
         )
-        print(f"POST /execute at capacity -> 503 {body!r} (as expected)")
+        for session_id in session_ids[1:]:
+            assert await touch(session_id) == 200, (
+                f"Session {session_id} was evicted, but it was more recently used than the oldest one"
+            )
+        print("Exactly the least-recently-used session was evicted (as expected)")
 
-        # The sessions that do exist are unaffected by the refusals.
-        result = await _execute(session, api_url, "bash", "echo still-alive", session_id=session_ids[0])
-        assert result["return_code"] == 0, f"An existing session broke while at capacity: {result!r}"
-        print("An existing session still executes while the server is at capacity (as expected)")
+        # 3. A busy session is never evicted, however long it has been idle beforehand. Every
+        # remaining session runs something at once; those queued for an execution slot hold
+        # their session's lock too.
+        live_ids = session_ids[1:]
+        await asyncio.sleep(cfg.eviction_min_idle + 1)
+        holders = [
+            asyncio.create_task(_execute(session, api_url, "bash", "sleep 4; echo held", session_id=session_id))
+            for session_id in live_ids
+        ]
+        try:
+            await asyncio.sleep(1.5)  # let every holder take its session's lock
+            await assert_refused("every session is busy")
+        finally:
+            # Cancelling the client request would not stop the run, so wait for it, or the
+            # sessions are still locked at cleanup time.
+            results = await asyncio.gather(*holders, return_exceptions=True)
+        for session_id, result in zip(live_ids, results):
+            assert isinstance(result, dict) and result["return_code"] == 0, (
+                f"A busy session broke while the server was at capacity: {session_id}: {result!r}"
+            )
+        print("Busy sessions still executed normally while at capacity (as expected)")
 
     async with session.post(f"{api_url}/sessions") as response:
         assert response.status == 200, (
@@ -2090,8 +2145,9 @@ GROUPS: tuple[Group, ...] = (
     Group("network"),
     Group("timeout", opt_in=True, requires="EXECUTION_TIMEOUT small (5s or less), passed as --execution-timeout"),
     Group("capacity", opt_in=True,
-          requires="MAX_SESSIONS and MAX_CONCURRENT_EXECUTIONS both small (4 or less), passed as "
-                   "--max-sessions/--max-concurrent-executions; run this group on its own, since it "
+          requires="MAX_SESSIONS and MAX_CONCURRENT_EXECUTIONS both small (4 or less) and "
+                   "SESSION_EVICTION_MIN_IDLE_SECONDS small (2s), passed as --max-sessions/"
+                   "--max-concurrent-executions/--eviction-min-idle; run this group on its own, since it "
                    "saturates limits the other checks need"),
     Group("lock", opt_in=True,
           requires="SESSION_LOCK_WAIT_TIMEOUT_SECONDS small (2s or less), passed as --lock-wait-timeout"),
@@ -2212,7 +2268,7 @@ CHECKS: tuple[Check, ...] = (
     Check("execution_timeout", check_execution_timeout, group="timeout", timeout=300.0,
           summary="an overrunning run is cut off, keeping its partial output and files"),
     Check("session_capacity", check_session_capacity, group="capacity", sessions=0, timeout=300.0,
-          summary="at MAX_SESSIONS both /sessions and ephemeral /execute return 503"),
+          summary="at MAX_SESSIONS the LRU idle session is evicted, and 503 when none is evictable"),
     Check("ephemeral_sessions_release_slots", check_ephemeral_sessions_release_slots,
           group="capacity", sessions=0, timeout=300.0,
           summary="back-to-back throwaway runs never exhaust capacity"),

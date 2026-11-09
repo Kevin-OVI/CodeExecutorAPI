@@ -23,6 +23,7 @@ from .config import (
     MAX_SESSION_ENTRIES,
     MAX_SESSION_SIZE,
     PODMAN_CHECK_TIMEOUT_SECONDS,
+    SESSION_EVICTION_MIN_IDLE_SECONDS,
     SESSION_INACTIVITY_TIMEOUT_SECONDS,
     SESSION_LOCK_WAIT_TIMEOUT_SECONDS,
     SESSION_QUOTA_COMMAND,
@@ -394,29 +395,101 @@ class SessionManager:
         if project_id is not None:
             self._free_project_ids.append(project_id)
 
-    async def create(self) -> Session:
-        if len(self._sessions) >= MAX_SESSIONS:
-            raise SessionLimitReached
-        session_id = secrets.token_urlsafe(16)
-        work_directory = tempfile.mkdtemp(prefix="code_executor_session_", dir=SESSION_ROOT_DIRECTORY)
-        project_id = self._allocate_project_id() if SESSION_QUOTA_MOUNTPOINT is not None else None
+    async def _claim_eviction_victim(self) -> Session | None:
+        """Take the least-recently-used evictable session out of the manager, or return None.
 
-        # Reserve the session slot (and the MAX_SESSIONS budget) synchronously, before the
-        # first `await` below, so a concurrent create() can't slip past the capacity check.
-        session = Session(id=session_id, work_directory=work_directory, project_id=project_id)
-        self._sessions[session_id] = session
+        A session is evictable when nothing holds or is queued on its lock and it has been idle
+        for at least SESSION_EVICTION_MIN_IDLE_SECONDS. The victim is returned locked and
+        already removed from `self._sessions`, so its slot is free as of the return; retiring
+        its directory is left to the caller.
+        """
+        now = time.monotonic()
+        for session in sorted(self._sessions.values(), key=lambda candidate: candidate.last_used):
+            if now - session.last_used < SESSION_EVICTION_MIN_IDLE_SECONDS:
+                break  # sorted oldest first, so every remaining session is more recent still
+            if not await _try_acquire_lock(session.lock):
+                continue
+            # The try-acquire is an await: the session may have been retired or used meanwhile.
+            if (
+                self._sessions.get(session.id) is session
+                and time.monotonic() - session.last_used >= SESSION_EVICTION_MIN_IDLE_SECONDS
+            ):
+                del self._sessions[session.id]
+                return session
+            session.lock.release()
+        return None
+
+    async def _create(self) -> Session:
+        """Create a session and return it with its lock held, evicting idle ones if full."""
+        # Taken before the session is visible to anyone, so it cannot contend, and it keeps the
+        # session from being evicted by a concurrent create() before the caller has used it.
+        lock = asyncio.Lock()
+        await lock.acquire()
+
+        victims: list[Session] = []
         try:
-            if project_id is not None:
-                await _apply_quota(work_directory, project_id)
-        except BaseException:
-            self._sessions.pop(session_id, None)
-            self._release_project_id(project_id)
-            # Best-effort: this is a fresh mkdtemp that no code has run against yet, so there is
-            # nothing here for _remove_tree to unlock, and the original failure is the one to raise.
-            with contextlib.suppress(OSError):
-                await asyncio.to_thread(_remove_tree, work_directory)
-            raise
+            # Each claim is an await, so a concurrent create() can take the slot it frees; keep
+            # claiming until one is free when control comes back here. Returning from the
+            # awaited claim does not yield to the event loop, so the slot it freed is still
+            # free at the reservation below.
+            while len(self._sessions) >= MAX_SESSIONS:
+                victim = await self._claim_eviction_victim()
+                if victim is None:
+                    raise SessionLimitReached
+                victims.append(victim)
+
+            session_id = secrets.token_urlsafe(16)
+            work_directory = tempfile.mkdtemp(prefix="code_executor_session_", dir=SESSION_ROOT_DIRECTORY)
+            project_id = self._allocate_project_id() if SESSION_QUOTA_MOUNTPOINT is not None else None
+
+            # Reserve the session slot (and the MAX_SESSIONS budget) synchronously, before the
+            # first `await` below, so a concurrent create() can't slip past the capacity check.
+            session = Session(id=session_id, work_directory=work_directory, project_id=project_id, lock=lock)
+            self._sessions[session_id] = session
+            try:
+                if project_id is not None:
+                    await _apply_quota(work_directory, project_id)
+            except BaseException:
+                self._sessions.pop(session_id, None)
+                self._release_project_id(project_id)
+                # Best-effort: this is a fresh mkdtemp that no code has run against yet, so there is
+                # nothing here for _remove_tree to unlock, and the original failure is the one to raise.
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(_remove_tree, work_directory)
+                raise
+        finally:
+            # Victims are already out of `self._sessions`, so they are retired whatever happened
+            # above - even when their slot went to a concurrent create() and this one failed.
+            for victim in victims:
+                try:
+                    await self._retire_locked(victim)
+                except Exception:
+                    LOGGER.exception("Failed to evict session %s", victim.id)
+                else:
+                    LOGGER.info("Evicted session %s to make room for a new one", victim.id)
+                finally:
+                    victim.lock.release()
         return session
+
+    @contextlib.asynccontextmanager
+    async def create_locked(self) -> AsyncGenerator[Session, Any]:
+        """Create a session and hold its lock for the body of the `async with`.
+
+        If the body raises, the session is deleted before the exception propagates: a session
+        whose setup failed is never handed back to anyone.
+        """
+        session = await self._create()
+        try:
+            yield session
+        except BaseException:
+            try:
+                await self._retire_locked(session)
+            except Exception:
+                LOGGER.exception("Failed to delete session %s after its setup failed", session.id)
+            raise
+        finally:
+            session.last_used = time.monotonic()
+            session.lock.release()
 
     async def _delete(self, session: Session) -> None:
         try:
@@ -431,6 +504,18 @@ class SessionManager:
         finally:
             # Both the sweep and delete_all iterate a snapshot, so the session may already be gone.
             self._sessions.pop(session.id, None)
+
+    async def _retire_locked(self, session: Session) -> None:
+        """Delete a session whose lock the caller holds, and see the deletion through."""
+        deletion = asyncio.create_task(self._delete(session))
+        try:
+            await asyncio.shield(deletion)
+        except asyncio.CancelledError:
+            # Cancelling the await cannot stop rmtree's worker thread. Keep the session locked
+            # until deletion finishes, including during shutdown.
+            with contextlib.suppress(Exception):
+                await deletion
+            raise
 
     async def delete(self, session_id: str) -> None:
         async with self.locked(session_id) as session:
@@ -452,6 +537,9 @@ class SessionManager:
             session.last_used = time.monotonic()
             yield session
         finally:
+            # Stamped on release too, so idleness - for expiry and eviction alike - counts from
+            # the end of the last request, not from the start of a long execution.
+            session.last_used = time.monotonic()
             session.lock.release()
 
     @contextlib.asynccontextmanager
@@ -475,15 +563,7 @@ class SessionManager:
                     continue
                 if now - session.last_used <= SESSION_INACTIVITY_TIMEOUT_SECONDS:
                     continue
-                deletion = asyncio.create_task(self._delete(session))
-                try:
-                    await asyncio.shield(deletion)
-                except asyncio.CancelledError:
-                    # Cancelling the await cannot stop rmtree's worker thread. Keep the
-                    # session locked until deletion finishes, including during shutdown.
-                    with contextlib.suppress(Exception):
-                        await deletion
-                    raise
+                await self._retire_locked(session)
             except Exception as e:
                 LOGGER.exception("Failed to sweep expired session %s", session.id, exc_info=e)
             else:
