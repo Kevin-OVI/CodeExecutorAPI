@@ -72,9 +72,11 @@ for environment in "${environments[@]}"; do
 done
 wait_jobs
 
+# Warm one image at a time: each image gets its own re-owned copy of its files, and creating it
+# holds the storage lock, so running them in parallel would not finish any sooner.
 for environment in "${environments[@]}"; do
-  start_job "warm $environment" podman run --rm --userns="keep-id:uid=$uid,gid=$uid" "$prefix-$environment" true
+  echo "[warm $environment] Warming $prefix-$environment"
+  podman run --rm --userns="keep-id:uid=$uid,gid=$uid" "$prefix-$environment" true
 done
-wait_jobs
 
 echo "Built and warmed: ${environments[*]/#/$prefix-}"
