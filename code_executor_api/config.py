@@ -81,7 +81,7 @@ MAX_RESULT_ATTACHMENTS = _read_int_env("MAX_RESULT_ATTACHMENTS", 256, min_value=
 MAX_SESSIONS = _read_int_env("MAX_SESSIONS", 64, min_value=1)
 MAX_CONCURRENT_EXECUTIONS = _read_int_env("MAX_CONCURRENT_EXECUTIONS", 4, min_value=1)
 CONTAINER_PIDS_LIMIT = _read_int_env("CONTAINER_PIDS_LIMIT", 128, min_value=1)
-CONTAINER_USER_ID = _read_int_env("CONTAINER_USER_ID", 4000, min_value=1)  # uid *and* gid of `appuser` in every sandbox image; must match executor_images/base/Containerfile, since `--userns=keep-id` maps the host service account onto it
+CONTAINER_USER_ID = _read_int_env("CONTAINER_USER_ID", 4000, min_value=1)  # uid *and* gid of `appuser` in every sandbox image; executed code runs as it and the file helper gives session files to it; must match executor_images/base/Containerfile and fall inside the service account's /etc/subuid range
 CONTAINER_ULIMIT_NOFILE = _read_int_env("CONTAINER_ULIMIT_NOFILE", 1024, min_value=1)
 CONTAINER_ULIMIT_FSIZE = _read_int_env("CONTAINER_ULIMIT_FSIZE", 256 * 1024 * 1024, min_value=1)  # bytes
 CONTAINER_RELATIVE_NICENESS = _read_int_env("CONTAINER_RELATIVE_NICENESS", 5)

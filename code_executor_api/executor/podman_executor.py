@@ -6,11 +6,10 @@ import os
 import pty
 import secrets
 import select
-import stat
 import threading
 import time
 from contextlib import suppress
-from typing import Iterator, NamedTuple
+from typing import NamedTuple
 
 from ..config import (
     CONTAINER_NETWORK,
@@ -53,46 +52,28 @@ def _close_noerror(fd: int):
         pass
 
 
-def _iter_session_files(work_directory: str) -> Iterator[tuple[str, os.stat_result]]:
-    """Yield `(sub_path, lstat)` for every regular file in the session.
+type _Signature = tuple[int, int, int, int]
 
-    Hidden directories are skipped at any depth: the session directory doubles as the
-    container's `$HOME`, so `.cache`, `.local`, `.npm` and friends fill up with package
-    manager noise that is never a meaningful execution result.
 
-    Symlinks and other non-regular entries are never yielded, so they can be neither
-    reported as results nor followed off the session tree.
+async def _snapshot_session(session: Session) -> dict[str, _Signature]:
+    """Map every regular file in the session to a cheap change-detection stamp.
+
+    The walk runs in the file helper, since executed code can leave directories the API itself
+    cannot enter. It skips hidden directories at any depth: the session directory doubles as
+    the container's `$HOME`, so `.cache`, `.local`, `.npm` and friends fill up with package
+    manager noise that is never a meaningful execution result. Symlinks and other non-regular
+    entries are never reported, so they can be neither returned as results nor followed off the
+    session tree.
+
+    The stamp is `(st_ino, st_size, st_mtime_ns, st_ctime_ns)` rather than a content hash: one
+    `lstat` instead of a full read. `st_ino` catches a delete-and-recreate, and `st_ctime_ns`
+    catches an `mtime` rewound with `utimensat` (which bumps `ctime` itself) as well as any
+    metadata-only change.
     """
-    prefix_length = len(work_directory) + 1
-    pending = [work_directory]
-    while pending:
-        directory = pending.pop()
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if entry.is_dir(follow_symlinks=False):
-                        if not entry.name.startswith("."):
-                            pending.append(entry.path)
-                        continue
-                    try:
-                        entry_stat = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    if stat.S_ISREG(entry_stat.st_mode):
-                        yield entry.path[prefix_length:], entry_stat
-        except OSError as exc:
-            LOGGER.debug("Skipping unreadable session directory %s: %s", directory, exc)
-            continue
-
-
-def _signature(entry_stat: os.stat_result) -> tuple[int, int, int, int]:
-    """Cheap change-detection stamp for a regular file.
-
-    A stamp rather than a content hash: one `lstat` instead of a full read. `st_ino`
-    catches a delete-and-recreate, and `st_ctime_ns` catches an `mtime` rewound with
-    `utimensat` (which bumps `ctime` itself) as well as any metadata-only change.
-    """
-    return (entry_stat.st_ino, entry_stat.st_size, entry_stat.st_mtime_ns, entry_stat.st_ctime_ns)
+    rows, fd = await session.fs_helper.call("snapshot", session=session.directory_name)
+    if fd is not None:
+        _close_noerror(fd)
+    return {sub_path: (ino, size, mtime_ns, ctime_ns) for sub_path, ino, size, mtime_ns, ctime_ns in rows}
 
 
 def read_max_and_close(master_fd: int, slave_fd: int, stop_evt: threading.Event, max_size: int = MAX_OUTPUT_SIZE) -> bytes:
@@ -153,14 +134,14 @@ async def _remove_container(container_name: str) -> bool:
 class ExecutionEnvironment:
     """One container run against a session, plus the before/after diff of its files.
 
-    Constructing this stamps every file in the session, so it must happen before the container
-    starts - `collect_changes` has nothing to compare against otherwise. Neither half takes a
-    lock; the caller's session lock is what keeps a concurrent write out.
+    Build it with `create`, which stamps every file in the session, so it must happen before
+    the container starts - `collect_changes` has nothing to compare against otherwise. Neither
+    half takes a lock; the caller's session lock is what keeps a concurrent write out.
     """
 
     __slots__ = ("session", "language", "code", "container_name", "input_files")
 
-    def __init__(self, session: Session, language: str, code: str):
+    def __init__(self, session: Session, language: str, code: str, input_files: dict[str, _Signature]):
         if language not in LANGUAGES:
             raise ValueError(f"Unsupported language: {language}")
         self.session = session
@@ -169,10 +150,15 @@ class ExecutionEnvironment:
 
         self.container_name = f"ce_{secrets.token_urlsafe(16)}"
 
-        self.input_files: dict[str, tuple[int, int, int, int]] = {
-            sub_path: _signature(entry_stat)
-            for sub_path, entry_stat in _iter_session_files(session.work_directory)
-        }
+        self.input_files = input_files
+
+    @classmethod
+    async def create(cls, session: Session, language: str, code: str) -> "ExecutionEnvironment":
+        """Stamp the session's files and return an environment ready to run.
+
+        A factory because taking the snapshot is an await, which a constructor cannot do.
+        """
+        return cls(session, language, code, await _snapshot_session(session))
 
     async def run_container(self) -> ExecutionResult:
         return_code = -1
@@ -202,13 +188,12 @@ class ExecutionEnvironment:
                 "--ulimit", f"nofile={CONTAINER_ULIMIT_NOFILE}:{CONTAINER_ULIMIT_NOFILE}",
                 "--ulimit", f"fsize={CONTAINER_ULIMIT_FSIZE}:{CONTAINER_ULIMIT_FSIZE}",
                 "--cgroupns=private",
-                # Map the container's `appuser` onto the host service account, so session files
-                # have a single owner on both sides of the bind mount. Without it the two uids
-                # differ under rootless Podman and neither side can fully manage the other's
-                # files. The explicit uid/gid is required: a bare `keep-id` maps the host user to
-                # the *same* id in the container, which only lines up if the service account
-                # happens to share CONTAINER_USER_ID.
-                f"--userns=keep-id:uid={CONTAINER_USER_ID},gid={CONTAINER_USER_ID}",
+                # No `--userns`: the container gets podman's default rootless mapping, and
+                # `--user` runs the code as container uid CONTAINER_USER_ID, which is a
+                # subordinate host uid that owns nothing outside the session. An escape therefore
+                # lands on an identity with no claim on the API's code, venv or image storage, and
+                # images need no re-chown to run. Session files are usable from inside because the
+                # file helper creates them owned by that same uid.
                 f"--user={CONTAINER_USER_ID}:{CONTAINER_USER_ID}",
                 "--ipc=none",
                 f"--net={CONTAINER_NETWORK}",
@@ -271,7 +256,7 @@ class ExecutionEnvironment:
             return_code=return_code, execution_time=execution_time, timed_out=timed_out,
         )
 
-    def collect_changes(self) -> tuple[list[str], list[str]]:
+    async def collect_changes(self) -> tuple[list[str], list[str]]:
         """Return `(changed_files, deleted_files)` for the finished run, both complete.
 
         The whole session is walked - it is bounded by the session's inode quota - and every
@@ -280,21 +265,18 @@ class ExecutionEnvironment:
 
         Both lists are sorted, so a caller that has to truncate cuts deterministically.
         """
-        changed_files = []
-        current_files: set[str] = set()
-        for sub_path, entry_stat in _iter_session_files(self.session.work_directory):
-            current_files.add(sub_path)
-            if self.input_files.get(sub_path) != _signature(entry_stat):
-                changed_files.append(sub_path)
-
-        changed_files.sort()
-        return changed_files, sorted(self.input_files.keys() - current_files)
+        current_files = await _snapshot_session(self.session)
+        changed_files = sorted(
+            sub_path for sub_path, signature in current_files.items()
+            if self.input_files.get(sub_path) != signature
+        )
+        return changed_files, sorted(self.input_files.keys() - current_files.keys())
 
 
 async def run_code_async(session: Session, language: str, code: str) -> CodeExecutionResult:
-    environment: ExecutionEnvironment = await asyncio.to_thread(ExecutionEnvironment, session, language, code)
+    environment = await ExecutionEnvironment.create(session, language, code)
     execution_result = await environment.run_container()
-    changed_files, deleted_files = await asyncio.to_thread(environment.collect_changes)
+    changed_files, deleted_files = await environment.collect_changes()
     return CodeExecutionResult(
         execution_result=execution_result,
         changed_files=changed_files,

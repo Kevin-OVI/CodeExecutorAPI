@@ -19,32 +19,19 @@ Linux only: the sandbox depends on rootless Podman, and the per-session limits o
 
 - Python 3.12+
 - Podman (the `podman` CLI must be on the API process's `PATH`)
-- The [sandbox images](#sandbox-images) must be built before starting the API, then warmed once, both **as the user that runs the API** - `executor_images/build.sh` does the two in one go, building every image in parallel
+- The [sandbox images](#sandbox-images) must be built before starting the API, **as the user that runs the API** - `executor_images/build.sh` builds every image in parallel
   ```bash
   executor_images/build.sh            # every environment
   executor_images/build.sh rust gcc   # only these (the base images are always rebuilt, which is a cache hit if unchanged)
   ```
-  The warm-up matters. Because `--userns=keep-id` asks for a uid mapping that differs from the storage's default one, Podman has to re-chown an image the first time it is used that way (`storage-chown-by-maps`). For the larger toolchains that is GiBs of I/O and minutes of wall clock - far longer than `EXECUTION_TIMEOUT`, so without the warm-up the first real execution in that language just times out. The result is cached per (image, mapping), so every later run starts in well under a second; the script redoes it after each rebuild, as `podman run --rm --userns=keep-id:uid=4000,gid=4000 <image> true`. It also costs roughly the image's own size again on disk, since the original layers are kept alongside the remapped ones.
-
   The API runs with `--pull=never`, so an image that was never built fails its executions straight away instead of sending Podman to look for the name in a registry.
 
-  Building as root does not avoid this: the chown happens in the *service account's* container
-  storage, keyed to the mapping it asks for, so an image built or pulled by another user still pays
-  it on first use. Rootless can't sidestep it with an idmapped volume either - a custom
-  `--volume ...:idmap=uids=...` mapping needs privileges rootless does not have, and a plain
-  `:idmap` maps the host user onto container uid `0`, not `CONTAINER_USER_ID`.
+The API shells out to `podman run` as the user running the service, so that user needs a working Podman setup, and the API requires that setup to be **rootless** (with lingering enabled if the service is not started from a login session). Rootful Podman is not supported: `podman unshare`, which runs the file helper below, refuses to run as root, so a rootful deployment fails at startup - and without a user namespace, container uid `4000` would be the real host uid `4000`. Notes:
 
-The API shells out to `podman run` as the user running the service, so that user needs a working
-Podman setup (rootful, or rootless with lingering enabled if the service is not started from a
-login session). Two rootless-specific notes:
-
-- Session working directories are bind-mounted into the container, and the executor passes `--userns=keep-id:uid=<CONTAINER_USER_ID>,gid=<CONTAINER_USER_ID>` so the image's `appuser` maps onto the host service account. That gives session files a single owner on both sides of the mount: without it the two uids differ under rootless Podman and neither side can fully manage the other's files (the API cannot read back or clean up what executed code created, and uploads are not writable from inside the container). The code runs as `appuser` because the executor also passes `--user=<CONTAINER_USER_ID>:<CONTAINER_USER_ID>` - the images set no `USER`, so they build as root throughout. The id is pinned to `4000` in both `executor_images/base/Containerfile` and `CONTAINER_USER_ID`; keep them in sync. It is deliberately not `1000`, so that if the user namespace is ever lost the container's uid does not land on a real host account.
-- Rootless additionally requires `/etc/subuid` and `/etc/subgid` ranges for the service account that
-  are **wider than `CONTAINER_USER_ID`**, since Podman maps container ids below it into that range
-  before mapping `CONTAINER_USER_ID` itself to the host user. The conventional 65536-wide allocation
-  is ample; a hand-trimmed range is not.
-- On SELinux-enforcing hosts, bind mounts need a relabel: append `:Z` to the `--volume` argument in
-  `code_executor_api/executor/podman_executor.py`.
+- Session working directories are bind-mounted into the container, which runs with Podman's default rootless user namespace: container uid `0` is the service account, and container uids from `1` up map onto the service account's subordinate range from `/etc/subuid`. The code runs as `appuser` because the executor passes `--user=<CONTAINER_USER_ID>:<CONTAINER_USER_ID>` - the images set no `USER`, so they build as root throughout - and on the host that uid is a subordinate one (`103999` with a range starting at `100000`) that owns nothing outside the session directories. Because images run with the storage's own mapping, a never-run image starts as fast as any other: there is no per-image re-chown. The id is pinned to `4000` in both `executor_images/base/Containerfile` and `CONTAINER_USER_ID`; keep them in sync. It is deliberately not `1000`, so that if the user namespace is ever missing the container's uid does not land on a real host account.
+- Session files therefore have two owners: the service account owns the session root, and `CONTAINER_USER_ID` owns each session's directory and everything in it. The API bridges the two with a file helper (`code_executor_api/fs_helper.py`) it starts under `podman unshare`, where it holds `CAP_CHOWN`, `CAP_DAC_OVERRIDE` and `CAP_FOWNER` over the subordinate ids. The helper creates each session directory (mode `0700`) still owned by the service account, so the session's XFS quota can be applied to it, and only then hands it over to `CONTAINER_USER_ID`. It creates uploads owned by `CONTAINER_USER_ID`, lists, opens, deletes and removes what executed code creates, and passes open file descriptors back to the API over a socket pair. It is confined to `SESSION_ROOT_DIRECTORY` and walks every path one component at a time without following symlinks. The API starts it at startup - if it cannot, the server does not start - and restarts it if it dies. `podman unshare` needs nothing beyond the working rootless setup `podman run` already does.
+- Rootless additionally requires `/etc/subuid` and `/etc/subgid` ranges for the service account that are **wider than `CONTAINER_USER_ID`**, since container ids from `1` up map into that range in order, `CONTAINER_USER_ID` included. The conventional 65536-wide allocation is ample; a hand-trimmed range is not.
+- On SELinux-enforcing hosts, bind mounts need a relabel: append `:Z` to the `--volume` argument in `code_executor_api/executor/podman_executor.py`.
 
 ## Sandbox images
 
@@ -109,7 +96,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `MAX_SESSIONS` | `64` | Once reached, creating a session evicts the least-recently-used idle one - see `SESSION_EVICTION_MIN_IDLE_SECONDS` |
 | `MAX_CONCURRENT_EXECUTIONS` | `4` | |
 | `CONTAINER_PIDS_LIMIT` | `128` | |
-| `CONTAINER_USER_ID` | `4000` | uid *and* gid of `appuser` inside every sandbox image; must match `executor_images/base/Containerfile` |
+| `CONTAINER_USER_ID` | `4000` | uid *and* gid of `appuser` inside every sandbox image: executed code runs as it, and the file helper gives session files to it. Must match `executor_images/base/Containerfile` and fall inside the service account's `/etc/subuid` and `/etc/subgid` ranges |
 | `CONTAINER_ULIMIT_NOFILE` | `1024` | |
 | `CONTAINER_ULIMIT_FSIZE` | `268435456` | Bytes, per individual file |
 | `CONTAINER_RELATIVE_NICENESS` | `5` | Added to the API process's own niceness |
@@ -123,7 +110,7 @@ Read from the environment at import (see `code_executor_api/config.py`). A malfo
 | `SESSION_LOCK_WAIT_TIMEOUT_SECONDS` | `30` | Seconds a request waits for a session lock or an execution slot before returning `409`/`503` |
 | `SESSION_ROOT_DIRECTORY` | system temp dir | Base directory for session working directories |
 | `SESSION_QUOTA_MOUNTPOINT` | unset | XFS mount point containing `SESSION_ROOT_DIRECTORY`. Unset leaves both session limits unenforced, which the server refuses to start under without `--no-session-quota` - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
-| `SESSION_QUOTA_COMMAND` | `xfs_quota` | argv prefix for `xfs_quota`, split like a shell command line but exec'd directly. Set it to `sudo -n /usr/sbin/xfs_quota` to delegate `CAP_SYS_ADMIN` without running the API as root - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
+| `SESSION_QUOTA_COMMAND` | `xfs_quota` | argv prefix for `xfs_quota`, split like a shell command line but exec'd directly. Set it to `sudo -n /usr/sbin/xfs_quota` to delegate `CAP_SYS_ADMIN` to that one command - see [Enforcing `MAX_SESSION_SIZE`](#enforcing-max_session_size-with-an-xfs-project-quota) |
 
 Running a second (e.g. test) deployment means pointing a separate process at a separate `PORT`/`PODMAN_IMAGE_PREFIX` via its own environment, with the images built under that prefix (`PODMAN_IMAGE_PREFIX=code_executor_test executor_images/build.sh`).
 
@@ -231,9 +218,9 @@ Each check is handed its own freshly created session and its own is deleted afte
 
 | Group | What it covers |
 |---|---|
-| `core` | Session and file lifecycle, `PUT`/`GET`/`DELETE` including nested parents, directories, symlinks and zero-byte bodies, directory listings, sub_path containment, and that an interrupted `PUT` leaves the original file intact with no staging debris |
+| `core` | Session and file lifecycle, `PUT`/`GET`/`DELETE` including nested parents, directories, symlinks and zero-byte bodies, directory listings, sub_path containment, that an interrupted `PUT` leaves the original file intact with no staging debris, and that files cross the two owners both ways: executed code can append to an upload, and the API attaches, lists, reads and deletes a `0600` file code made in a `0700` directory |
 | `languages` | All nine languages: module styles for `javascript`, type syntax for `typescript` (and that it is CommonJS, so top-level `await` fails), and for each compiled language a hello world, a compile error with diagnostics, and the requirement that nothing is left in the session directory |
-| `sandbox` | Read-only root filesystem, symlink containment, `RLIMIT_NOFILE`, and (heavy) that `MAX_MEMORY` kills rather than hangs, `CONTAINER_PIDS_LIMIT` bounds process creation without breaking the session, and `MAX_OUTPUT_SIZE` truncates without failing the run |
+| `sandbox` | Read-only root filesystem, symlink containment, that the container uid is a subordinate one rather than the service account, `RLIMIT_NOFILE`, and (heavy) that `MAX_MEMORY` kills rather than hangs, `CONTAINER_PIDS_LIMIT` bounds process creation without breaking the session, and `MAX_OUTPUT_SIZE` truncates without failing the run |
 | `results` | Change detection including cases a naive `(size, mtime)` stamp would miss, the `MAX_RESULT_ATTACHMENTS` cap and its `omitted_files`, that `deleted_files` is never truncated, that a non-UTF-8 filename is omitted rather than fatal, and that awkward filenames (quotes, newlines, spaces, non-ASCII, nested paths) survive `Content-Disposition` exactly |
 | `errors` | The documented status codes for malformed `/execute` and `/sessions` requests, and that a rejected request leaves neither attachments nor session slots behind |
 | `network` | That the sandbox has the outbound access `CONTAINER_NETWORK` intends, and that executed code **cannot** reach the API that is running it |
@@ -336,6 +323,10 @@ Verify both with the harness - `api_unreachable_from_sandbox` probes the host al
 python harness.py --only api_unreachable_from_sandbox outbound_network
 ```
 
+### A container escape lands on a subordinate uid
+
+Executed code runs as `CONTAINER_USER_ID` inside Podman's default rootless user namespace, which on the host is a subordinate uid of the service account (`103999` with a `/etc/subuid` range starting at `100000`), not the service account itself. That uid owns nothing on the host but the session directories: the API's code, its virtualenv and the Podman image storage all belong to the service account, which code escaping the container does not become. It does own every session's directory, so what keeps an escape out of other sessions is the session root: keep `SESSION_ROOT_DIRECTORY` owned by the service account with mode `0700`, and that uid cannot traverse it to reach them. The file helper and Podman are unaffected, since both work as the namespace's root, which maps to the service account. Left unset, `SESSION_ROOT_DIRECTORY` falls back to the system temp directory, which anyone can traverse, so other sessions' directories are reachable there.
+
 ### Execution output stays out of the journal
 
 On a systemd host, Podman's default `log_driver` is `journald`: conmon copies everything a container writes to stdout and stderr into the host journal. Here that output is produced by user-submitted code, so it would let any caller of `/execute` write arbitrary content into `journalctl` - forged log lines, terminal escape sequences, or enough volume to rotate genuine entries out.
@@ -409,9 +400,9 @@ SESSION_QUOTA_MOUNTPOINT=/var/lib/code_executor/sessions
 
 Confirm the value is right before starting the service - `xfs_quota -x -c 'state' "$SESSION_QUOTA_MOUNTPOINT"` should report `Project quota state: ON` and, under `Accounting/Enforcement`, `ON` rather than the accounting-only state that `pqnoenforce` produces.
 
-On session creation, `SessionManager` allocates a project id and runs `xfs_quota -x -c 'project -s -p <dir> <id>' -c 'limit -p bhard=<MAX_SESSION_SIZE in KiB>k ihard=<MAX_SESSION_ENTRIES> <id>' <mountpoint>`, tagging the session's directory so any write exceeding either quota - from the API or from code running in the container - fails with `ENOSPC` (surfaced as a `413` from the API, or as a normal write error inside the container). XFS reports project quotas as `ENOSPC` rather than `EDQUOT`, and does so for both limits, so exhausting the inode allowance is indistinguishable from filling the byte allowance without consulting `xfs_quota report`. This requires the API process to be able to run `xfs_quota -x`, which needs `CAP_SYS_ADMIN`. Do not run the whole API as root for it: after the identity-mapping change above, quota setup is the *only* thing left that wants privilege, so granting root to the entire service - which parses untrusted multipart input and handles filenames chosen by executed code - buys one subprocess call at the price of making any API bug a root compromise.
+On session creation, `SessionManager` allocates a project id and runs `xfs_quota -x -c 'project -s -p <dir> <id>' -c 'limit -p bhard=<MAX_SESSION_SIZE in KiB>k ihard=<MAX_SESSION_ENTRIES> <id>' <mountpoint>`, tagging the session's directory so any write exceeding either quota - from the API or from code running in the container - fails with `ENOSPC` (surfaced as a `413` from the API, or as a normal write error inside the container). XFS reports project quotas as `ENOSPC` rather than `EDQUOT`, and does so for both limits, so exhausting the inode allowance is indistinguishable from filling the byte allowance without consulting `xfs_quota report`. The quota is applied right after the file helper creates the session directory, while the service account still owns it, and only then does the helper hand the directory over to `CONTAINER_USER_ID` - so `xfs_quota` never has to open a directory owned by the container user, and executed code never gets a directory without its quota. This requires the API process to be able to run `xfs_quota -x`, which needs `CAP_SYS_ADMIN`. The API itself runs unprivileged - rootless Podman requires it - and quota setup is the *only* thing that wants privilege, so it should get no more than that one call: the service parses untrusted multipart input and handles filenames chosen by executed code, and any wider grant would turn an API bug into a privilege escalation.
 
-Delegate just that call instead, with a sudoers rule scoped to the binary:
+Delegate just that call, with a sudoers rule scoped to the binary:
 
 ```
 codeexec ALL=(root) NOPASSWD: /usr/sbin/xfs_quota -x -c *
@@ -441,7 +432,7 @@ Both hard limits are verified after they are set, because `limit` can exit 0 wit
 - `code_executor_api/sessions.py` - `Session`/`SessionManager`: locking, creation/deletion, expiry sweep, and (when `SESSION_QUOTA_MOUNTPOINT` is set) per-session XFS project quota setup
 - `code_executor_api/executor/podman_executor.py` - Podman container invocation and file-diffing
 - `code_executor_api/routes/` - `/sessions`, `/sessions/{id}/files/{path}`, `/execute` (and `/sessions/{id}/execute`), `/health` handlers
-- `executor_images/` - one directory per sandbox image, each with its `Containerfile` and, for the compiled languages, the `executors/*.sh` scripts that compile and run them; `build.sh` builds and warms them all (see [Sandbox images](#sandbox-images))
+- `executor_images/` - one directory per sandbox image, each with its `Containerfile` and, for the compiled languages, the `executors/*.sh` scripts that compile and run them; `build.sh` builds them all (see [Sandbox images](#sandbox-images))
 
 ## Dependencies
 

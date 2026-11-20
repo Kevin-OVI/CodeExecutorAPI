@@ -6,10 +6,8 @@ import logging
 import os
 import posixpath
 import secrets
-import shutil
 import stat
 import sys
-import tempfile
 import time
 from typing import Any, AsyncGenerator
 
@@ -28,10 +26,10 @@ from .config import (
     SESSION_LOCK_WAIT_TIMEOUT_SECONDS,
     SESSION_QUOTA_COMMAND,
     SESSION_QUOTA_MOUNTPOINT,
-    SESSION_ROOT_DIRECTORY,
     SESSION_SWEEP_INTERVAL_SECONDS,
 )
-from .file_helpers import SupportedContentType, read_file, write_file_to_temp
+from .file_helpers import SupportedContentType, read_file, write_to_fd
+from .fs_client import FsHelper
 from .validation import normalize_sub_path
 
 LOGGER = logging.getLogger(__name__)
@@ -70,8 +68,8 @@ _PROJECT_ID_MAX = 2 ** 31 - 1
 async def _run_xfs_quota(*args: str) -> tuple[int, str, str]:
     try:
         # SESSION_QUOTA_COMMAND is an argv prefix, not a shell string, so a sudo wrapper adds
-        # no quoting or injection surface. It defaults to a bare `xfs_quota`, which is what a
-        # root API - or one relying on file capabilities - needs.
+        # no quoting or injection surface. It defaults to a bare `xfs_quota`, which is what an
+        # API relying on file capabilities on the binary needs.
         process = await asyncio.create_subprocess_exec(
             *SESSION_QUOTA_COMMAND, *args,
             stdout=asyncio.subprocess.PIPE,
@@ -147,38 +145,6 @@ async def _apply_quota(work_directory: str, project_id: int) -> None:
     await _verify_quota_hard_limit(project_id, "-i", "inode")
 
 
-def _entry_type(st_mode: int) -> str:
-    if stat.S_ISREG(st_mode):
-        return "file"
-    if stat.S_ISDIR(st_mode):
-        return "directory"
-    if stat.S_ISLNK(st_mode):
-        return "symlink"
-    return "other"
-
-
-def _remove_tree(path: str) -> None:
-    """Remove a session tree, restoring traversal on anything executed code locked down.
-
-    Executed code owns the files it creates, including their permission bits, so it can leave
-    behind a mode-000 directory the API cannot descend into - by accident as easily as on
-    purpose, since any build step that produces one does it. `os.fwalk` is top-down, so each
-    directory is made traversable before it is descended into.
-
-    Symlinks are skipped: chmod follows its final component, so following one would change the
-    mode of a path outside the session. The `dir_fd` form keeps that structural rather than
-    relying on the caller's lock to rule out a swapped parent.
-    """
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o700)
-    for _, directory_names, _, directory_fd in os.fwalk(path):
-        for name in directory_names:
-            with contextlib.suppress(OSError):
-                if stat.S_ISDIR(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode):
-                    os.chmod(name, 0o700, dir_fd=directory_fd)
-    shutil.rmtree(path)
-
-
 async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
     """Take `lock` if it is free right now, otherwise report failure without waiting.
 
@@ -195,116 +161,79 @@ async def _try_acquire_lock(lock: asyncio.Lock) -> bool:
 
 @dataclasses.dataclass
 class Session:
+    """One session's directory, plus the lock and bookkeeping that guard it.
+
+    Executed code and the API run as different host users, and the files executed code
+    creates are out of the API's reach. Every operation on the tree therefore goes through
+    `fs_helper`, which runs inside podman's rootless user namespace, confines each request to
+    this session's directory and hands opened descriptors back where content has to flow.
+    """
+
     id: str
     work_directory: str
+    fs_helper: FsHelper
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     last_used: float = dataclasses.field(default_factory=time.monotonic)
     project_id: int | None = None
 
-    @contextlib.contextmanager
-    def _open_parent(self, normalised_sub_path: str, create_dir: bool):
-        """Open the directory holding `normalised_sub_path`, yielding `(fd, final_name, path)`.
+    @property
+    def directory_name(self) -> str:
+        """The session directory's basename: the name the file helper knows the session by."""
+        return os.path.basename(self.work_directory)
 
-        This is what keeps file operations inside the session. Executed code owns the tree and
-        can swap any component for a symlink between a check and the syscall, so the walk
-        descends one component at a time with `O_NOFOLLOW` and callers act relative to the fd
-        yielded here, never on a reassembled path.
+    async def _call(self, op: str, **args: Any) -> Any:
+        """Run a helper operation on this session that has no descriptor to hand back.
 
-        A symlinked or non-directory component (ELOOP, ENOTDIR) is reported as a plain
-        `FileNotFoundError`: an escape attempt need not be distinguishable from a typo.
+        Any descriptor that arrives anyway is closed, so a protocol mismatch cannot leak one.
         """
-        path_parts = normalised_sub_path.split("/")
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-        parent_fd = os.open(self.work_directory, flags)
-        try:
-            for path_part in path_parts[:-1]:
-                if create_dir:
-                    try:
-                        os.mkdir(path_part, 0o700, dir_fd=parent_fd)
-                    except FileExistsError:
-                        pass
-                try:
-                    next_fd = os.open(path_part, flags, dir_fd=parent_fd)
-                except OSError as exc:
-                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                        raise FileNotFoundError(normalised_sub_path) from None
-                    raise
-                os.close(parent_fd)
-                parent_fd = next_fd
-            yield parent_fd, path_parts[-1], normalised_sub_path
-        finally:
-            os.close(parent_fd)
+        result, fd = await self.fs_helper.call(op, session=self.directory_name, **args)
+        if fd is not None:
+            os.close(fd)
+        return result
 
-    def read_file(self, sub_path: str, field_name: str | None = None) -> IOBasePayload:
+    async def read_file(self, sub_path: str, field_name: str | None = None) -> IOBasePayload:
+        """Open a regular file in the session as a response payload that owns its descriptor.
+
+        The helper does the confined walk and reports anything with no content to serve - a
+        symlink, a socket, a device node with no driver behind it - as `FileNotFoundError`,
+        the same not-found an absent file gets. Errnos that mean the *server* is in trouble
+        (EMFILE, ENOMEM) stay what they are, and so a 500.
+        """
         normalised_sub_path = normalize_sub_path(sub_path)
-        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, normalised_sub_path):
-            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-            try:
-                fd = os.open(filename, flags, dir_fd=parent_fd)
-            except OSError as exc:
-                # None of these have content to serve: a looping or dangling symlink (ELOOP), a
-                # device node with no driver behind it (ENODEV), or a socket, which cannot be
-                # opened at all (ENXIO). The caller asked for file content and there is none,
-                # which is the same not-found an absent file gets. Errnos that mean the *server*
-                # is in trouble (EMFILE, ENOMEM) deliberately stay a 500.
-                if exc.errno in (errno.ELOOP, errno.ENXIO, errno.ENODEV, errno.ENOTDIR):
-                    raise FileNotFoundError(normalised_sub_path) from None
-                raise
-            try:
-                file_mode = os.fstat(fd).st_mode
-                if stat.S_ISDIR(file_mode):
-                    # Distinct from "not found" so the files API can serve a listing instead.
-                    raise IsADirectoryError(normalised_sub_path)
-                if not stat.S_ISREG(file_mode):
-                    raise FileNotFoundError(normalised_sub_path)
-            except BaseException:
-                os.close(fd)
-                raise
-            return read_file(fd, filename=normalised_sub_path, field_name=field_name)
+        _, fd = await self.fs_helper.call("open_read", session=self.directory_name, sub_path=normalised_sub_path)
+        if fd is None:
+            raise OSError(errno.EIO, "File helper returned no descriptor", normalised_sub_path)
+        try:
+            file_mode = os.fstat(fd).st_mode
+            if stat.S_ISDIR(file_mode):
+                # Distinct from "not found" so the files API can serve a listing instead.
+                raise IsADirectoryError(normalised_sub_path)
+            if not stat.S_ISREG(file_mode):
+                raise FileNotFoundError(normalised_sub_path)
+        except BaseException:
+            os.close(fd)
+            raise
+        return read_file(fd, filename=normalised_sub_path, field_name=field_name)
 
-    def list_directory(self, sub_path: str) -> dict[str, Any]:
+    async def list_directory(self, sub_path: str) -> dict[str, Any]:
         """List one directory level, without following symlinks anywhere along the path.
 
         Unlike execution results this hides nothing: hidden directories and symlinks are
-        reported too, so a caller can always discover what a session actually holds.
+        reported too, so a caller can always discover what a session actually holds. A target
+        that is a symlink or not a directory raises `NotADirectoryError`.
         """
-        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         normalised_sub_path = "" if sub_path.strip("/") == "" else normalize_sub_path(sub_path)
-
-        if not normalised_sub_path:
-            fd = os.open(self.work_directory, flags)
-        else:
-            with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
-                try:
-                    fd = os.open(filename, flags, dir_fd=parent_fd)
-                except OSError as exc:
-                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                        raise NotADirectoryError(normalised_sub_path) from None
-                    raise
-
-        try:
-            entries = []
-            for name in os.listdir(fd):
-                try:
-                    entry_stat = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                except OSError:
-                    continue
-                entries.append({
-                    "name": name,
-                    "type": _entry_type(entry_stat.st_mode),
-                    "size": entry_stat.st_size,
-                    "modified_at": entry_stat.st_mtime,
-                })
-        finally:
-            os.close(fd)
-
-        entries.sort(key=lambda entry: entry["name"])
+        entries = await self._call("list", sub_path=normalised_sub_path)
         return {"path": normalised_sub_path, "entries": entries}
 
     async def stage_file(self, sub_path: str, content: SupportedContentType) -> tuple[str, str]:
         """Write `content` to a hidden temp file inside sub_path's parent directory, without
         making it visible under `sub_path` yet. Returns (normalised_sub_path, temporary_name)
         to later pass to commit_staged_file (reveal it) or discard_staged_file (drop it).
+
+        The helper creates the temp file - and any missing parent directories - owned by the
+        container user, so executed code can use the file once it is committed, and hands back
+        a write descriptor that the content is streamed into here.
 
         The session's total size is not tracked here: MAX_SESSION_SIZE is the XFS project
         quota's job, so a host-mediated write runs into exactly the same kernel limit as one
@@ -313,8 +242,19 @@ class Session:
         """
         normalised_sub_path = normalize_sub_path(sub_path)
         try:
-            with self._open_parent(normalised_sub_path, True) as (parent_fd, _, _):
-                temporary_name, _ = await write_file_to_temp(parent_fd, content, CONTAINER_ULIMIT_FSIZE)
+            temporary_name, fd = await self.fs_helper.call(
+                "stage", session=self.directory_name, sub_path=normalised_sub_path
+            )
+            try:
+                if fd is None:
+                    raise OSError(errno.EIO, "File helper returned no descriptor", normalised_sub_path)
+                await write_to_fd(fd, content, CONTAINER_ULIMIT_FSIZE)
+            except BaseException:
+                # Whatever stopped the write, a partial temp file must not stay behind eating
+                # into the session's quota.
+                with contextlib.suppress(OSError):
+                    await self.discard_staged_file(normalised_sub_path, temporary_name)
+                raise
         except HTTPRequestEntityTooLarge:
             # Same outward error (413, JSON body) whether the per-file cap or the OS-enforced
             # XFS quota below is what actually rejected the write.
@@ -326,35 +266,46 @@ class Session:
         return normalised_sub_path, temporary_name
 
     async def commit_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
-        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
-            os.replace(temporary_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        """Reveal a staged file under `normalised_sub_path`, or discard it if that fails.
+
+        Either way the staged file is dealt with by the time this returns or raises, so callers
+        never discard it themselves. Cancelling the await cannot stop the helper, which carries
+        on with the rename in its own process: a discard sent meanwhile would run on another
+        helper thread and race it. A cancellation therefore waits for the commit to finish, and
+        discards only if the commit did not succeed.
+        """
+        commit = asyncio.ensure_future(
+            self._call("commit", sub_path=normalised_sub_path, temp_name=temporary_name)
+        )
+        try:
+            await asyncio.shield(commit)
+        except asyncio.CancelledError:
+            try:
+                await commit
+            except Exception:
+                with contextlib.suppress(OSError):
+                    await self.discard_staged_file(normalised_sub_path, temporary_name)
+            raise
+        except BaseException:
+            with contextlib.suppress(OSError):
+                await self.discard_staged_file(normalised_sub_path, temporary_name)
+            raise
 
     async def discard_staged_file(self, normalised_sub_path: str, temporary_name: str) -> None:
-        with self._open_parent(normalised_sub_path, False) as (parent_fd, _, _):
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_name, dir_fd=parent_fd)
+        await self._call("discard", sub_path=normalised_sub_path, temp_name=temporary_name)
 
     async def write_file(self, sub_path: str, content: SupportedContentType):
         normalised_sub_path, temporary_name = await self.stage_file(sub_path, content)
         try:
             await self.commit_staged_file(normalised_sub_path, temporary_name)
-        except BaseException as exc:
-            # Catch everything, not just OSError: whatever goes wrong, the staged file must not
-            # survive the failed write. An `except OSError` is too narrow on both counts - a NUL
-            # in the path makes os.replace raise ValueError, and a CancelledError can arrive
-            # mid-commit - and either one escaping here leaves the temp file behind.
-            with contextlib.suppress(OSError):
-                await self.discard_staged_file(normalised_sub_path, temporary_name)
-            if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        except OSError as exc:
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT):
                 raise SessionResourceLimitReached("Session storage or file count limit reached") from None
             raise
 
-    def delete_file(self, sub_path: str):
-        normalised_sub_path = normalize_sub_path(sub_path)
-        with self._open_parent(normalised_sub_path, False) as (parent_fd, filename, _):
-            if stat.S_ISDIR(os.stat(filename, dir_fd=parent_fd, follow_symlinks=False).st_mode):
-                raise IsADirectoryError(filename)
-            os.unlink(filename, dir_fd=parent_fd)
+    async def delete_file(self, sub_path: str):
+        """Delete one file or symlink; a directory raises `IsADirectoryError`."""
+        await self._call("delete", sub_path=normalize_sub_path(sub_path))
 
     def get_sub_path(self, full_path: str):
         """Convert an absolute host path into a session-relative one, rejecting anything outside.
@@ -369,7 +320,8 @@ class Session:
 
 
 class SessionManager:
-    def __init__(self):
+    def __init__(self, fs_helper: FsHelper):
+        self._fs_helper = fs_helper
         self._sessions: dict[str, Session] = {}
         self._sweep_task: asyncio.Task | None = None
         self._execution_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXECUTIONS)
@@ -428,34 +380,53 @@ class SessionManager:
 
         victims: list[Session] = []
         try:
-            # Each claim is an await, so a concurrent create() can take the slot it frees; keep
-            # claiming until one is free when control comes back here. Returning from the
-            # awaited claim does not yield to the event loop, so the slot it freed is still
-            # free at the reservation below.
-            while len(self._sessions) >= MAX_SESSIONS:
-                victim = await self._claim_eviction_victim()
-                if victim is None:
-                    raise SessionLimitReached
-                victims.append(victim)
-
-            session_id = secrets.token_urlsafe(16)
-            work_directory = tempfile.mkdtemp(prefix="code_executor_session_", dir=SESSION_ROOT_DIRECTORY)
-            project_id = self._allocate_project_id() if SESSION_QUOTA_MOUNTPOINT is not None else None
-
-            # Reserve the session slot (and the MAX_SESSIONS budget) synchronously, before the
-            # first `await` below, so a concurrent create() can't slip past the capacity check.
-            session = Session(id=session_id, work_directory=work_directory, project_id=project_id, lock=lock)
-            self._sessions[session_id] = session
+            # Created before the capacity check: creating the directory is an await, and nothing
+            # may await between the check and the reservation below.
+            directory_name, _ = await self._fs_helper.call("create_session")
+            work_directory = os.path.join(self._fs_helper.session_root, directory_name)
+            session: Session | None = None
+            project_id: int | None = None
             try:
+                # Each claim is an await, so a concurrent create() can take the slot it frees;
+                # keep claiming until one is free when control comes back here. Returning from
+                # the awaited claim does not yield to the event loop, so the slot it freed is
+                # still free at the reservation below.
+                while len(self._sessions) >= MAX_SESSIONS:
+                    victim = await self._claim_eviction_victim()
+                    if victim is None:
+                        raise SessionLimitReached
+                    victims.append(victim)
+
+                session_id = secrets.token_urlsafe(16)
+                project_id = self._allocate_project_id() if SESSION_QUOTA_MOUNTPOINT is not None else None
+
+                # Reserve the session slot (and the MAX_SESSIONS budget) synchronously, before
+                # the next `await`, so a concurrent create() can't slip past the capacity check.
+                session = Session(
+                    id=session_id,
+                    work_directory=work_directory,
+                    fs_helper=self._fs_helper,
+                    project_id=project_id,
+                    lock=lock,
+                )
+                self._sessions[session_id] = session
+                # The helper creates the directory owned by the service account, and only hands it
+                # over to the container user once the quota is in place. The order matters:
+                # xfs_quota runs as the service account, and when it does so through file
+                # capabilities - CAP_SYS_ADMIN, which overrides no permission check - it can only
+                # open and tag the directory while the service account still owns it. Handing it
+                # over last also means executed code never gets a directory without its quota.
                 if project_id is not None:
                     await _apply_quota(work_directory, project_id)
+                await session._call("hand_over")
             except BaseException:
-                self._sessions.pop(session_id, None)
+                if session is not None:
+                    self._sessions.pop(session.id, None)
                 self._release_project_id(project_id)
-                # Best-effort: this is a fresh mkdtemp that no code has run against yet, so there is
-                # nothing here for _remove_tree to unlock, and the original failure is the one to raise.
+                # Best-effort: no code has run against this directory yet, and the original
+                # failure is the one to raise.
                 with contextlib.suppress(OSError):
-                    await asyncio.to_thread(_remove_tree, work_directory)
+                    await self._fs_helper.call("remove_tree", session=directory_name)
                 raise
         finally:
             # Victims are already out of `self._sessions`, so they are retired whatever happened
@@ -469,6 +440,7 @@ class SessionManager:
                     LOGGER.info("Evicted session %s to make room for a new one", victim.id)
                 finally:
                     victim.lock.release()
+        assert session is not None
         return session
 
     @contextlib.asynccontextmanager
@@ -493,7 +465,7 @@ class SessionManager:
 
     async def _delete(self, session: Session) -> None:
         try:
-            await asyncio.to_thread(_remove_tree, session.work_directory)
+            await self._fs_helper.call("remove_tree", session=session.directory_name)
         except OSError:
             # Hold the project id back rather than hand a successor an allowance that is already
             # partly spent: the usage is still on disk, and _verify_quota_hard_limit only checks
@@ -511,8 +483,8 @@ class SessionManager:
         try:
             await asyncio.shield(deletion)
         except asyncio.CancelledError:
-            # Cancelling the await cannot stop rmtree's worker thread. Keep the session locked
-            # until deletion finishes, including during shutdown.
+            # Cancelling the await cannot stop the helper's removal, which carries on in its own
+            # process. Keep the session locked until deletion finishes, including during shutdown.
             with contextlib.suppress(Exception):
                 await deletion
             raise

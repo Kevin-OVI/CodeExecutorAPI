@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Build the sandbox images in parallel, then warm each one for the uid mapping the API runs it
-# with (see "Requirements" in the README for why the warm-up cannot be skipped). Run it as the
-# user that runs the API, with the same PODMAN_IMAGE_PREFIX and CONTAINER_USER_ID.
+# Build the sandbox images in parallel. Run it as the user that runs the API, with the same
+# PODMAN_IMAGE_PREFIX, so the images land in that user's rootless storage under the names the API
+# looks for.
 #
 # Usage: executor_images/build.sh [environment...]
 #
-# With no argument every environment is built; naming some (`build.sh rust gcc`) builds and warms
-# only those. The two images in base/ are always built first, since everything else starts from
+# With no argument every environment is built; naming some (`build.sh rust gcc`) builds only
+# those. The two images in base/ are always built first, since everything else starts from
 # them - a cache hit when nothing in base/ changed.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 prefix="${PODMAN_IMAGE_PREFIX:-code_executor}"
-uid="${CONTAINER_USER_ID:-4000}"
 python_image="docker.io/library/python:3.15.2-trixie"
 
 # Every image the API runs, by the suffix `code_executor_api/languages.py` gives it. `bash` is
@@ -72,11 +71,4 @@ for environment in "${environments[@]}"; do
 done
 wait_jobs
 
-# Warm one image at a time: each image gets its own re-owned copy of its files, and creating it
-# holds the storage lock, so running them in parallel would not finish any sooner.
-for environment in "${environments[@]}"; do
-  echo "[warm $environment] Warming $prefix-$environment"
-  podman run --rm --userns="keep-id:uid=$uid,gid=$uid" "$prefix-$environment" true
-done
-
-echo "Built and warmed: ${environments[*]/#/$prefix-}"
+echo "Built: ${environments[*]/#/$prefix-}"

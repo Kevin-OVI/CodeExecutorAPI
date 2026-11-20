@@ -1,8 +1,6 @@
-import contextlib
 import io
 import os
 import re
-import secrets
 from typing import Awaitable, Callable
 from urllib.parse import quote
 
@@ -85,28 +83,22 @@ async def read_content(content: SupportedContentType, max_size: int) -> bytes:
     return writer.getvalue()
 
 
-async def write_file_to_temp(
-        parent_fd: int,
-        content: SupportedContentType,
-        max_size: int,
-) -> tuple[str, int]:
-    """Write `content` to a hidden temp file inside the directory referenced by `parent_fd`,
-    without making it visible under any final name yet. Returns (temporary_name, size); the
-    caller decides whether to reveal it (`os.replace` it into place) or discard it."""
-    temporary_name = f".code_executor_upload_{secrets.token_urlsafe(8)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+async def write_to_fd(fd: int, content: SupportedContentType, max_size: int) -> int:
+    """Stream `content` into the writable descriptor `fd`, capped at `max_size` bytes.
+
+    Takes ownership of `fd` and closes it whether or not the write succeeds. Returns the
+    number of bytes written. What happens to a partly written file on failure is the
+    caller's decision, since only the caller knows where the descriptor points.
+    """
+    owned_fd: int | None = fd
     try:
         async with aopen(fd, "wb", closefd=True) as f:
-            fd = None
-            size = await write_file_content(f, content, max_size)
+            owned_fd = None  # the file object closes it from here on
+            return await write_file_content(f, content, max_size)
     except BaseException:
-        if fd is not None:
-            os.close(fd)
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary_name, dir_fd=parent_fd)
+        if owned_fd is not None:
+            os.close(owned_fd)
         raise
-    return temporary_name, size
 
 
 _NON_ASCII_FILENAME = re.compile(r"[^A-Za-z0-9._-]")

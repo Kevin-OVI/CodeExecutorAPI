@@ -19,11 +19,11 @@ async def handle_get_file(request: web.Request) -> web.Response:
             try:
                 if not sub_path.strip("/"):
                     # An empty path is the session root, which is always a directory.
-                    return web.json_response(session.list_directory(sub_path))
+                    return web.json_response(await session.list_directory(sub_path))
                 try:
-                    content = session.read_file(sub_path)
+                    content = await session.read_file(sub_path)
                 except IsADirectoryError:
-                    return web.json_response(session.list_directory(sub_path))
+                    return web.json_response(await session.list_directory(sub_path))
             except (FileNotFoundError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
     except SessionNotFound:
@@ -63,7 +63,7 @@ async def handle_delete_file(request: web.Request) -> web.Response:
     try:
         async with session_manager.locked(session_id) as session:
             try:
-                session.delete_file(sub_path)
+                await session.delete_file(sub_path)
             except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return web.json_response({"error": "File not found"}, status=404)
     except SessionNotFound:

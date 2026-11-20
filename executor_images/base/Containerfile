@@ -17,10 +17,11 @@ RUN --mount=type=cache,target=/var/cache/apt,id=apt,sharing=locked \
 
 ENV PATH="/usr/games:${PATH}"
 
-# The id is pinned because `podman run --userns=keep-id:uid=...,gid=...` maps the host service
-# account onto it (see CONTAINER_USER_ID in code_executor_api/config.py); an unpinned `useradd`
-# would take whatever is free. 4000 rather than the default 1000 so that if the user namespace is
-# ever lost, the container's uid does not land on a real host account.
+# The id is pinned because it is the uid executed code runs as (`podman run --user`) and the uid
+# the API's file helper gives session files, so code can use them (see CONTAINER_USER_ID in
+# code_executor_api/config.py); an unpinned `useradd` would take whatever is free. 4000 rather
+# than the default 1000 so that if the user namespace is ever missing, the container's uid does
+# not land on a real host account.
 #
 # There is deliberately no `USER appuser`: the API selects the user with `podman run --user`, so
 # every image builds as root throughout instead of switching back to root to install anything.

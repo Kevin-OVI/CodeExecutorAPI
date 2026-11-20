@@ -2,6 +2,7 @@ import logging
 
 from aiohttp import web
 
+from .fs_client import FsHelper
 from .routes import handle_create_session, handle_delete_file, handle_delete_session, handle_execute, handle_get_file, handle_health, handle_put_file
 from .sessions import SessionManager
 
@@ -9,21 +10,30 @@ LOGGER = logging.getLogger(__name__)
 
 
 async def on_startup(app: web.Application) -> None:
+    fs_helper: FsHelper = app["fs_helper"]
     session_manager: SessionManager = app["session_manager"]
+    # Raises if the helper cannot start, which keeps the server from starting: without it no
+    # session file can be created, read or removed.
+    await fs_helper.start()
     session_manager.start_sweep()
-    LOGGER.info("Server startup complete: session sweep task started")
+    LOGGER.info("Server startup complete: file helper and session sweep task started")
 
 
 async def on_cleanup(app: web.Application) -> None:
     session_manager: SessionManager = app["session_manager"]
     await session_manager.stop_sweep()
     await session_manager.delete_all()
+    # After delete_all, which removes the session trees through the helper.
+    fs_helper: FsHelper = app["fs_helper"]
+    await fs_helper.stop()
     LOGGER.info("Server shutdown complete: all sessions deleted")
 
 
 def create_app() -> web.Application:
     app = web.Application()
-    app["session_manager"] = SessionManager()
+    fs_helper = FsHelper()
+    app["fs_helper"] = fs_helper
+    app["session_manager"] = SessionManager(fs_helper)
 
     app.router.add_post("/sessions", handle_create_session)
     app.router.add_delete("/sessions/{session_id}", handle_delete_session)

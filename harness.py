@@ -280,6 +280,92 @@ async def check_execute_attachments(session: aiohttp.ClientSession, api_url: str
     print("GET attached.txt -> matches uploaded attachment")
 
 
+async def check_code_can_use_uploads(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
+    """A file PUT into a new subdirectory is readable and writable by executed code.
+
+    The API's file helper creates the upload and its missing parents owned by CONTAINER_USER_ID,
+    so the code can append to the file and add entries next to it, and the API reads the
+    result back.
+    """
+    async with session.put(f"{api_url}/sessions/{session_id}/files/uploads/nested/data.txt", data=b"uploaded\n") as response:
+        assert response.status == 204, f"PUT uploads/nested/data.txt failed: {response.status}"
+    print("PUT uploads/nested/data.txt -> 204")
+
+    result = await _execute(
+        session, api_url, "bash",
+        "cat uploads/nested/data.txt && echo appended >> uploads/nested/data.txt "
+        "&& echo sibling > uploads/nested/sibling.txt && echo written",
+        session_id=session_id,
+    )
+    output = _plain(result["output"])
+    print(f"Use the upload from code: output={output!r} return_code={result['return_code']} "
+          f"files={list(result['files'])}")
+    assert result["return_code"] == 0, (
+        f"Executed code could not read and write an uploaded file and its directory: {output!r} "
+        "-- uploads must be owned by the container user"
+    )
+    assert output.startswith("uploaded\n"), f"Executed code read unexpected content: {output!r}"
+    assert result["files"].get("uploads/nested/data.txt") == b"uploaded\nappended\n", (
+        "The appended upload was not returned as an attachment"
+    )
+    assert result["files"].get("uploads/nested/sibling.txt") == b"sibling\n", (
+        "A file created next to the upload was not returned as an attachment"
+    )
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/uploads/nested/data.txt") as response:
+        assert response.status == 200, f"GET uploads/nested/data.txt failed: {response.status}"
+        content = await response.read()
+    assert content == b"uploaded\nappended\n", f"Unexpected content after the append: {content!r}"
+    print("GET uploads/nested/data.txt -> includes the line executed code appended (as expected)")
+
+
+async def check_api_can_use_code_files(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
+    """What executed code creates privately is still attached, listed, read and deleted by the API.
+
+    The code creates a 0700 directory holding a 0600 file. Both are owned by CONTAINER_USER_ID,
+    which on the host is not the service account, so the API only reaches them through its file
+    helper.
+    """
+    result = await _execute(
+        session, api_url, "bash",
+        "mkdir -m 0700 private && echo secret > private/secret.txt && chmod 0600 private/secret.txt "
+        "&& stat -c '%a %n' private private/secret.txt",
+        session_id=session_id,
+    )
+    output = _plain(result["output"])
+    print(f"Create private files: output={output!r} return_code={result['return_code']} "
+          f"files={list(result['files'])}")
+    assert result["return_code"] == 0, f"Creating the private directory and file failed: {output!r}"
+    assert "700 private\n" in output and "600 private/secret.txt" in output, (
+        f"The fixture does not have the intended modes: {output!r}"
+    )
+    assert result["files"].get("private/secret.txt") == b"secret\n", (
+        "A 0600 file in a 0700 directory was not returned as an /execute attachment"
+    )
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/private") as response:
+        assert response.status == 200, f"Expected 200 listing the private directory, got {response.status}"
+        listing = await response.json()
+    names = {entry["name"]: entry for entry in listing["entries"]}
+    assert sorted(names) == ["secret.txt"], f"Unexpected listing of the private directory: {sorted(names)}"
+    assert names["secret.txt"]["type"] == "file", f"secret.txt typed as {names['secret.txt']['type']!r}"
+    print(f"GET private/ -> {sorted(names)}")
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/private/secret.txt") as response:
+        assert response.status == 200, f"GET private/secret.txt failed: {response.status}"
+        content = await response.read()
+    assert content == b"secret\n", f"Unexpected private/secret.txt content: {content!r}"
+    print("GET private/secret.txt -> matches what executed code wrote")
+
+    async with session.delete(f"{api_url}/sessions/{session_id}/files/private/secret.txt") as response:
+        assert response.status == 204, f"DELETE private/secret.txt failed: {response.status}"
+    print("DELETE private/secret.txt -> 204")
+
+    async with session.get(f"{api_url}/sessions/{session_id}/files/private/secret.txt") as response:
+        assert response.status == 404, f"Expected 404 after deleting private/secret.txt, got {response.status}"
+    print("GET private/secret.txt after delete -> 404 (as expected)")
+
+
 async def check_symlink_attachment_excluded(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
     result = await _execute(
         session, api_url, "python", "import os\nos.symlink('/etc/passwd', 'leak')\nprint('linked')",
@@ -314,6 +400,34 @@ async def check_readonly_root_filesystem(session: aiohttp.ClientSession, api_url
     print(f"Write outside /app: output={result['output']!r} return_code={result['return_code']}")
     assert result["return_code"] != 0, "Writing outside the mounted /app directory unexpectedly succeeded"
     assert "read-only" in result["output"].lower(), f"Unexpected failure mode: {result['output']!r}"
+
+
+async def check_container_uid_is_subordinate(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
+    """The container user is not mapped onto the service account on its own.
+
+    Containers run in podman's default rootless user namespace, where CONTAINER_USER_ID falls in
+    the service account's subordinate range along with every other non-zero id, so code that
+    escapes the container lands on a uid that owns nothing on the host but session files. A
+    `--userns=keep-id:uid=...` mapping shows up in /proc/self/uid_map as a line mapping exactly
+    that one id (`4000 4100 1`), which hands the service account's identity to executed code.
+    """
+    result = await _execute(
+        session, api_url, "bash", "id -u && cat /proc/self/uid_map", session_id=session_id,
+    )
+    output = _plain(result["output"])
+    print(f"uid and uid_map inside the container: {output!r}")
+    assert result["return_code"] == 0, f"Reading the uid map failed: {output!r}"
+    first, *map_lines = output.strip().splitlines()
+    uid = int(first)
+    mappings = [line.split() for line in map_lines if line.strip()]
+    assert mappings, f"/proc/self/uid_map is empty: {output!r}"
+    single = [line for line in mappings if int(line[0]) == uid and int(line[2]) == 1]
+    assert not single, (
+        f"/proc/self/uid_map maps the container uid {uid} on its own ({' '.join(single[0])}), the "
+        "shape --userns=keep-id produces: executed code runs as the host service account. "
+        "podman_executor.py must not pass --userns"
+    )
+    print(f"Container uid {uid} is mapped as part of a range, not on its own (as expected)")
 
 
 async def check_disk_quota_enforcement(session: aiohttp.ClientSession, api_url: str, cfg: Config, session_id: str) -> None:
@@ -2064,8 +2178,8 @@ async def check_session_directory_removed(session: aiohttp.ClientSession, api_ur
     before = {path.name for path in root.glob("code_executor_session_*")}
     session_id = await _new_session(session, api_url)
 
-    # A directory the API cannot traverse. The owner bits apply to the API too, so this is
-    # not a privilege trick - it is what any ordinary program can do to its own files.
+    # A directory nothing can traverse without overriding its permissions. This is not a
+    # privilege trick - it is what any ordinary program can do to its own files.
     result = await _execute(
         session, api_url, "bash",
         "mkdir -p stubborn && echo content > stubborn/file.txt && chmod 000 stubborn && echo prepared",
@@ -2181,12 +2295,18 @@ CHECKS: tuple[Check, ...] = (
           summary="files persist and deletions are detected across two runs"),
     Check("execute_attachments", check_execute_attachments,
           summary="/execute attachments are staged into the session"),
+    Check("code_can_use_uploads", check_code_can_use_uploads,
+          summary="executed code can read and append to a file PUT into a new subdirectory"),
+    Check("api_can_use_code_files", check_api_can_use_code_files,
+          summary="a 0600 file in a 0700 directory made by code is attached, listed, read and deleted"),
     Check("symlink_attachment_excluded", check_symlink_attachment_excluded, group="sandbox",
           summary="a symlink is neither attached nor followed"),
     Check("symlink_directory_escape_blocked", check_symlink_directory_escape_blocked, group="sandbox",
           summary="a symlinked directory cannot be used to escape the session root"),
     Check("readonly_root_filesystem", check_readonly_root_filesystem, group="sandbox",
           summary="the container root filesystem is read-only"),
+    Check("container_uid_is_subordinate", check_container_uid_is_subordinate, group="sandbox",
+          summary="the container uid is not mapped onto the service account on its own"),
     Check("open_files_limit", check_open_files_limit, group="sandbox",
           summary="RLIMIT_NOFILE matches CONTAINER_ULIMIT_NOFILE"),
     Check("memory_limit", check_memory_limit, group="sandbox", heavy=True, timeout=180.0,

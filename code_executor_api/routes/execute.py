@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import logging
 
 from aiohttp import MultipartWriter, web
@@ -86,15 +87,15 @@ async def handle_execute(request: web.Request) -> web.Response:
                 validate_code(code)
                 assert language is not None and code is not None
 
-                # Drop each entry as it lands, so the `finally` below discards exactly those
-                # attachments that were never committed. This is not atomic - os.replace has
-                # overwritten the previous content by the time a later one fails - but the
-                # discard list stays accurate either way: a committed entry is never queued for
-                # a discard that would apply to whatever now holds its name.
+                # Each entry leaves the list before its commit, which deals with the staged file
+                # itself whatever happens - including a cancellation, which it sees through
+                # rather than let the `finally` below race a commit still running in the
+                # helper. So the `finally` discards exactly those attachments whose commit was
+                # never attempted. This is not atomic - os.replace has overwritten the previous
+                # content by the time a later one fails.
                 while staged:
-                    normalised_sub_path, temporary_name = staged[0]
+                    normalised_sub_path, temporary_name = staged.pop(0)
                     await session.commit_staged_file(normalised_sub_path, temporary_name)
-                    staged.pop(0)
             finally:
                 for normalised_sub_path, temporary_name in staged:
                     with contextlib.suppress(OSError):
@@ -113,15 +114,27 @@ async def handle_execute(request: web.Request) -> web.Response:
                 # slot, so a full response still carries MAX_RESULT_ATTACHMENTS files.
                 payloads = []
                 omitted_files = []
-                for sub_path in result.changed_files:
-                    if len(payloads) >= MAX_RESULT_ATTACHMENTS:
-                        omitted_files.append(sub_path)
-                        continue
-                    try:
-                        payloads.append(session.read_file(sub_path, field_name="attachments"))
-                    except (OSError, UnicodeError):
-                        LOGGER.warning("Omitting unreadable result attachment %s", sub_path)
-                        omitted_files.append(sub_path)
+                try:
+                    for sub_path in result.changed_files:
+                        if len(payloads) >= MAX_RESULT_ATTACHMENTS:
+                            omitted_files.append(sub_path)
+                            continue
+                        try:
+                            payloads.append(await session.read_file(sub_path, field_name="attachments"))
+                        except (OSError, UnicodeError) as exc:
+                            # EIO is the file helper failing, not this file: a 500, not an
+                            # attachment quietly reported as omitted.
+                            if isinstance(exc, OSError) and exc.errno == errno.EIO:
+                                raise
+                            LOGGER.warning("Omitting unreadable result attachment %s", sub_path)
+                            omitted_files.append(sub_path)
+                except BaseException:
+                    # Each payload owns an open file; close them now rather than leave them to
+                    # the garbage collector. `close()` schedules the file's closing without
+                    # waiting on it, so it is safe here even during a cancellation.
+                    for payload in payloads:
+                        await payload.close()
+                    raise
 
                 with MultipartWriter("mixed") as mpwriter:
                     result_payload = mpwriter.append_json(
